@@ -48,12 +48,32 @@ aws iam attach-role-policy \
     --policy-arn arn:aws:iam::YOUR_ACCOUNT_ID:policy/CloudWatchLogToS3Policy
 ```
 
-### 3. Lambda 함수 생성
+### 3. Lambda Layer 생성 및 연결
+```bash
+# Layer 배포 패키지 생성 (이미 준비된 layer.zip 사용)
+# 또는 새로운 Layer 생성:
+# mkdir -p layer/python
+# pip install python-dateutil -t layer/python/
+# zip -r layer.zip layer/
+
+# Lambda Layer 생성
+aws lambda publish-layer-version \
+    --layer-name cloudwatch-log-to-s3-dependencies \
+    --description "CloudWatch Log to S3 dependencies (python-dateutil)" \
+    --zip-file fileb://layer.zip \
+    --compatible-runtimes python3.9 \
+    --compatible-architectures x86_64
+
+# Layer ARN 저장 (출력에서 확인)
+LAYER_ARN="arn:aws:lambda:REGION:ACCOUNT:layer:cloudwatch-log-to-s3-dependencies:VERSION"
+```
+
+### 4. Lambda 함수 생성
 ```bash
 # 배포 패키지 생성
-zip -r lambda_deployment.zip . -x "*.git*" "*.venv*" "test_*" "*.pyc" "README.md"
+zip -r lambda_deployment.zip . -x "*.git*" "*.venv*" "test_*" "*.pyc" "README.md" "layer*"
 
-# Lambda 함수 생성
+# Lambda 함수 생성 (Layer 포함)
 aws lambda create-function \
     --function-name cloudwatch-log-to-s3 \
     --runtime python3.9 \
@@ -62,6 +82,7 @@ aws lambda create-function \
     --zip-file fileb://lambda_deployment.zip \
     --timeout 300 \
     --memory-size 512 \
+    --layers $LAYER_ARN \
     --environment Variables='{
         "S3_BUCKET_NAME":"your-s3-bucket-name",
         "REGION":"ap-northeast-2",
@@ -73,7 +94,7 @@ aws lambda create-function \
     }'
 ```
 
-### 4. EventBridge 규칙 생성 (정기 실행)
+### 5. EventBridge 규칙 생성 (정기 실행)
 ```bash
 aws events put-rule \
     --name cloudwatch-log-to-s3-schedule \
@@ -288,11 +309,18 @@ cat test-response.json
 2. **S3 접근 실패**: 버킷 이름 및 권한 확인
 3. **로그 수집 실패**: 로그그룹 이름 및 스트림 접두사 확인
 4. **상태 파일 오류**: S3 상태 파일 권한 확인
+5. **Layer 오류**: Layer ARN 및 버전 확인
 
 ### 디버깅
 ```bash
 # Lambda 함수 로그 확인
 aws logs tail /aws/lambda/cloudwatch-log-to-s3 --follow
+
+# Lambda 함수 설정 확인 (Layer 포함)
+aws lambda get-function --function-name cloudwatch-log-to-s3
+
+# Layer 정보 확인
+aws lambda list-layer-versions --layer-name cloudwatch-log-to-s3-dependencies
 
 # S3 상태 파일 확인
 aws s3 cp s3://your-bucket/CloudWatchLogsState/state.json -
@@ -313,6 +341,7 @@ aws lambda invoke \
 ## 🆕 최신 업데이트
 
 ### v1.1.0 (2025-07-04)
+- **Lambda Layer 지원**: python-dateutil 의존성을 Layer로 분리
 - **밀리초 정확도**: S3 파일명에 밀리초 포함
 - **정확한 패턴 매칭**: 길이 순 정렬과 매칭 추적 시스템
 - **Container Insights 지원**: EKS Container Insights 로그 패턴 자동 인식
