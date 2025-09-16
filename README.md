@@ -1,18 +1,19 @@
 # AWS CloudWatch Log to S3 (Lambda)
 
-AWS CloudWatch Log의 특정 로그그룹에서 로그스트림을 읽어서 압축한 뒤 S3에 저장하는 AWS Lambda 함수입니다. **Retention 삭제 직전 구간을 백업**하기 위해 각 로그그룹별로 시간 범위를 계산하여 수집/압축/업로드합니다.
+AWS CloudWatch Log의 특정 로그그룹에서 로그스트림을 읽어서 압축한 뒤 S3에 저장하는 AWS Lambda 함수입니다. **Retention 삭제 직전 구간을 백업**하거나 **전체 로그를 백업**하기 위해 각 로그그룹별로 시간 범위를 계산하여 수집/압축/업로드합니다.
 
 ## 🚀 주요 기능
 
 - **Retention 기반 시간 범위 계산**: CloudWatch Log Group의 Retention 설정을 기반으로 삭제 직전 구간 백업
+- **전체 백업 모드**: Retention 설정을 무시하고 가장 오래된 로그부터 전체 백업
 - **상태 관리**: S3에 상태 파일을 저장하여 연속적인 로그 수집 및 누락 방지
+- **시간 범위 검증**: State 파일 기반으로 중복 로그 수집 방지
 - **배치 처리**: 여러 로그그룹을 동시에 처리
 - **멀티스레딩**: Python ThreadPoolExecutor를 활용한 성능 최적화
 - **로그 압축**: gzip 압축으로 저장 공간 절약
 - **구조화된 S3 저장**: 날짜별 디렉토리 및 시간 범위 기반 파일명
 - **밀리초 정확도**: S3 파일명에 밀리초 포함으로 정확한 시간 추적
 - **정확한 패턴 매칭**: 길이 순 정렬과 매칭 추적으로 정확한 로그스트림 필터링
-- **Container Insights 지원**: EKS Container Insights 로그 패턴 자동 인식
 - **테스트 모드**: 정규식 패턴 매칭 테스트 기능
 
 ## 📋 요구사항
@@ -132,15 +133,21 @@ LOG_GROUP_NAME_1="/aws/eks/cluster-name/cluster"
 LOG_STREAM_PREFIX_1="kube-apiserver,kube-scheduler,kube-apiserver-audit,kube-controller-manager,authenticator"
 LOG_GROUP_RETENTION_DAY_1="1"  # Retention 설정에서 1일을 뺀 범위로 로그 수집
 
-# 두 번째 로그그룹 (Container Insights)
-LOG_GROUP_NAME_2="/aws/containerinsights/cluster-name/dataplane"
-LOG_STREAM_PREFIX_2="kube-proxy,kube-system"
+# 두 번째 로그그룹 (예시)
+LOG_GROUP_NAME_2="/aws/lambda/another-function"
+LOG_STREAM_PREFIX_2="2024"
 LOG_GROUP_RETENTION_DAY_2="2"  # Retention 설정에서 2일을 뺀 범위로 로그 수집
 
 # 세 번째 로그그룹 (Retention 설정 없음)
 LOG_GROUP_NAME_3="/aws/lambda/your-function"
 LOG_STREAM_PREFIX_3="2024"
 # LOG_GROUP_RETENTION_DAY_3 설정하지 않으면 기본 MINUTES_BACK 사용
+
+# 네 번째 로그그룹 (전체 백업 모드)
+LOG_GROUP_NAME_4="/aws/containerinsights/cluster-name/dataplane"
+LOG_STREAM_PREFIX_4="kube-proxy,aws-node,aws-eks-nodeagent"
+LOG_GROUP_FULL_BACKUP_4="true"  # 전체 백업 모드 활성화 (RETENTION 무시)
+# LOG_GROUP_RETENTION_DAY_4 설정하지 않음 (전체 백업 모드에서는 무시됨)
 ```
 
 ### 선택적 설정
@@ -157,12 +164,25 @@ USE_S3_STATE="true"  # 기본값: true
 
 ## 🔄 Retention 기반 시간 범위 계산
 
-### 동작 방식
+### 일반 모드 (기본)
 1. **CloudWatch Log Group의 Retention 설정 조회**
-2. **실제 Retention 삭제 시점 계산**: `현재시간 - (Retention일수 - LOG_GROUP_RETENTION_DAY_X)`
-3. **로그 수집 범위**: `삭제시점 - MINUTES_BACK` ~ `삭제시점`
+2. **무제한 Retention (Never expire) 감지 시**: 자동으로 전체 백업 모드로 전환
+3. **유한 Retention인 경우**: `현재시간 - (Retention일수 - LOG_GROUP_RETENTION_DAY_X)`
+4. **로그 수집 범위**: `삭제시점 - MINUTES_BACK` ~ `삭제시점`
+5. **연속 실행**: S3 State 파일을 통해 마지막 읽은 시간을 참조하여 중복된 시간 제외하고 시간 범위 계산
+
+### 전체 백업 모드 (LOG_GROUP_FULL_BACKUP_X="true")
+1. **RETENTION 설정 무시**: CloudWatch Log Group의 Retention 설정을 무시
+2. **MINUTES_BACK 기반 처리**: 기존과 동일하게 MINUTES_BACK 값만큼씩 시간 범위로 처리
+3. **가장 오래된 로그부터 시작**: State 파일이 없으면 가장 오래된 로그부터 읽기 시작
+4. **State 파일 기반 연속 처리**: S3 State 파일을 통해 마지막 읽은 시간부터 계속 읽기
+5. **연속 실행**: 정기적으로 실행하여 전체 로그를 점진적으로 백업
+6. **목적**: 로그그룹의 전체 로그를 안전하게 S3로 백업
+7. **모드 전환 지원**: 전체 백업 모드에서 일반 모드로 변경 시 State 파일 기반으로 올바른 시간 범위 계산
 
 ### 예시
+
+#### 유한 Retention 설정
 - **Retention 설정**: 7일
 - **LOG_GROUP_RETENTION_DAY_1**: 1
 - **MINUTES_BACK**: 30분
@@ -173,10 +193,36 @@ USE_S3_STATE="true"  # 기본값: true
 - `retention_deletion_time = 2025-01-20 10:00:00 - 6일 = 2025-01-14 10:00:00`
 - **수집 범위**: `2025-01-14 09:30:00 ~ 2025-01-14 10:00:00`
 
+**동작**:
+- **첫 번째 실행**: `09:30:00 ~ 10:00:00` → `last_read_time = 10:00:00`
+- **15분 뒤 두번째 실행**: `10:00:00 ~ 10:15:00` → `last_read_time = 10:30:00`  (중복된 시간 제외)
+
+#### 무제한 Retention 설정 (Never expire)
+- **Retention 설정**: Never expire (0일)
+- **LOG_GROUP_RETENTION_DAY_1**: 1 (설정되어 있어도 무시됨)
+- **MINUTES_BACK**: 30분
+- **현재 시간**: 2025-01-20 10:00:00
+
+**동작**:
+- **자동으로 전체 백업 모드로 전환**
+- **첫 실행**: 가장 오래된 로그부터 30분 범위 읽기
+- **연속 실행**: State 파일 기반으로 30분씩 점진적 백업
+
 ### 연속 실행 시 동작
 - **첫 번째 실행**: `09:30:00 ~ 10:00:00` → `last_read_time = 10:00:00`
 - **두 번째 실행**: `10:00:00 ~ 10:30:00` → `last_read_time = 10:30:00`
 - **결과**: 연속적으로 30분씩 로그 수집
+
+### 전체 백업 모드 연속 실행 시 동작
+- **첫 번째 실행**: 가장 오래된 로그부터 MINUTES_BACK(30분) 범위 읽기 → State 파일에 마지막 시간 저장
+- **두 번째 실행**: State 파일의 마지막 시간부터 MINUTES_BACK(30분) 범위 읽기 → State 파일 업데이트
+- **세 번째 실행**: 계속해서 다음 MINUTES_BACK(30분) 범위 읽기 → State 파일 업데이트
+- **결과**: 점진적으로 전체 로그를 백업 (기존 방식과 동일한 부하 분산)
+
+### 모드 전환 시 동작
+- **전체 백업 모드 → 일반 모드**: State 파일의 `last_read_time`을 기반으로 RETENTION 설정과 MINUTES_BACK으로 시간 범위 재계산
+- **시간 범위 검증**: 계산된 시간 범위가 State 파일의 `last_read_time`보다 이전인 경우 로그를 읽지 않고 건너뜀
+- **State 파일 보호**: 유효하지 않은 시간 범위인 경우 `last_read_time`을 업데이트하지 않음
 
 ## 🎯 정확한 패턴 매칭
 
@@ -200,27 +246,28 @@ kube-apiserver-audit-xxx → kube-apiserver-audit 접두사와 매칭
 kube-apiserver-xxx → kube-apiserver 접두사와 매칭 (audit 스트림은 제외됨)
 ```
 
-### Container Insights 패턴 지원
-EKS Container Insights의 복잡한 로그스트림 패턴을 자동으로 인식합니다:
-
-```
-# 일반 패턴
-kube-proxy-abc123
-
-# Container Insights 패턴
-ip-10-0-3-92.ap-northeast-2.compute.internal-dataplane.tail.var.log.containers.kube-proxy-h6msz_kube-system_kube-proxy-...
-```
 
 ## 📁 S3 저장 구조
 
 ### 파일명 형식 (밀리초 포함)
+
+#### 일반 모드
+```
+CloudWatchLogs/로그그룹명/로그스트림명/YYYY/MM/DD/YYYYMMDD_HHMMSS_MMM_YYYYMMDD_HHMMSS_MMM.log.gz
+```
+
+#### 전체 백업 모드 (일반 모드와 동일한 형식)
 ```
 CloudWatchLogs/로그그룹명/로그스트림명/YYYY/MM/DD/YYYYMMDD_HHMMSS_MMM_YYYYMMDD_HHMMSS_MMM.log.gz
 ```
 
 ### 예시
 ```
+# 일반 모드
 CloudWatchLogs/_aws_eks_cluster-name_cluster/kube-apiserver/2025/01/20/20250120_093000_123_20250120_100000_456.log.gz
+
+# 전체 백업 모드 (실제 로그 시간 범위 사용)
+CloudWatchLogs/_aws_containerinsights_cluster-name_dataplane/kube-proxy/2025/01/15/20250115_080000_000_20250115_090000_000.log.gz
 ```
 
 ### 디렉토리 구조
@@ -294,9 +341,14 @@ cat test-response.json
 ### 상태 관리 기능
 - **연속 읽기**: `last_read_time`을 기준으로 이어서 읽기
 - **스트림별 추적**: 각 로그스트림의 마지막 이벤트 시간 및 토큰 관리
+- **시간 범위 검증**: State 파일의 `last_read_time`과 계산된 시간 범위를 비교하여 중복 수집 방지
+- **모드 전환 지원**: 전체 백업 모드와 일반 모드 간 전환 시 State 파일 기반으로 올바른 시간 범위 계산
 
 ### 중요
 - 실행주기가 설정된 시간범위를 넘어선 경우 `last_read_time`을 무시하여 현재 실행 시간 기준으로 Retention 삭제 시점 재계산
+- **시간 범위 검증**: 계산된 시간 범위가 State 파일의 `last_read_time`보다 이전이거나 같은 경우 로그를 읽지 않고 건너뜀
+- **State 파일 보호**: 유효하지 않은 시간 범위인 경우 `last_read_time`을 업데이트하지 않음
+
 ### 예시
 - **MINUTES_BACK**: 30분
 - **마지막 실행**: 1시간 전
@@ -310,6 +362,9 @@ cat test-response.json
 3. **로그 수집 실패**: 로그그룹 이름 및 스트림 접두사 확인
 4. **상태 파일 오류**: S3 상태 파일 권한 확인
 5. **Layer 오류**: Layer ARN 및 버전 확인
+6. **전체 백업 모드 오류**: `LOG_GROUP_FULL_BACKUP_X="true"` 설정 확인
+7. **시간 범위 검증 실패**: State 파일의 `last_read_time`과 계산된 시간 범위 비교 확인
+8. **모드 전환 문제**: 전체 백업 모드에서 일반 모드로 변경 시 State 파일 상태 확인
 
 ### 디버깅
 ```bash
@@ -336,15 +391,35 @@ aws lambda invoke \
     --function-name cloudwatch-log-to-s3 \
     --payload '{"type": "test"}' \
     test-response.json
+
+# 전체 백업 모드 상태 확인
+aws s3 cp s3://your-bucket/CloudWatchLogsState/state.json - | jq '.["/aws/containerinsights/cluster-name/dataplane"]'
+
+# 시간 범위 검증 로그 확인
+aws logs filter-log-events \
+    --log-group-name /aws/lambda/cloudwatch-log-to-s3 \
+    --filter-pattern "시간 범위가 State 파일의 last_read_time보다 이전"
+
+# 모드 전환 로그 확인
+aws logs filter-log-events \
+    --log-group-name /aws/lambda/cloudwatch-log-to-s3 \
+    --filter-pattern "무제한 Retention 감지"
 ```
 
 ## 🆕 최신 업데이트
+
+### v1.2.0 (2025-01-16)
+- **전체 백업 모드**: Retention 설정을 무시하고 가장 오래된 로그부터 전체 백업하는 모드 추가
+- **시간 범위 검증**: State 파일 기반으로 중복 로그 수집 방지 로직 구현
+- **모드 전환 지원**: 전체 백업 모드와 일반 모드 간 전환 시 State 파일 기반으로 올바른 시간 범위 계산
+- **State 파일 보호**: 유효하지 않은 시간 범위인 경우 `last_read_time` 업데이트 방지
+- **에러 처리 개선**: 로그 수집 실패 시 명확한 에러 메시지 제공
+- **무제한 Retention 자동 감지**: "Never expire" 설정 시 자동으로 전체 백업 모드로 전환
 
 ### v1.1.0 (2025-07-04)
 - **Lambda Layer 지원**: python-dateutil 의존성을 Layer로 분리
 - **밀리초 정확도**: S3 파일명에 밀리초 포함
 - **정확한 패턴 매칭**: 길이 순 정렬과 매칭 추적 시스템
-- **Container Insights 지원**: EKS Container Insights 로그 패턴 자동 인식
 - **테스트 모드**: 정규식 패턴 매칭 테스트 기능 추가
 - **성능 최적화**: 중복 매칭 방지로 처리 속도 향상
 

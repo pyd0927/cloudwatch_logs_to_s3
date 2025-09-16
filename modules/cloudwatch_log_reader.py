@@ -14,7 +14,7 @@ class CloudWatchLogReader:
         self.region_name = region_name or Config.REGION
         self.client = boto3.client('logs', region_name=self.region_name)
         self.logger = logging.getLogger(__name__)
-        self.matched_streams = set()  # 이미 매칭된 스트림 추적
+        self.matched_streams = set()  # 이미 매칭된 스트림 추적 (접두사별로 초기화됨)
 
         if state_manager:
             self.state_manager = state_manager
@@ -40,9 +40,8 @@ class CloudWatchLogReader:
                 already_matched_count += 1
                 continue
 
-            # Container Insights 패턴: kube-proxy-h6msz_kube-system_kube-proxy-... 형태
-            # 접두사가 스트림 이름의 특정 위치에 정확히 매칭되는지 확인
-            if self._matches_container_insights_pattern(stream_name, prefix):
+            # 접두사가 스트림 이름에 정확히 매칭되는지 확인
+            if self._matches_stream_pattern(stream_name, prefix):
                 filtered_streams.append(stream)
                 matched_count += 1
                 # 매칭된 스트림을 추적에 추가
@@ -51,33 +50,67 @@ class CloudWatchLogReader:
                 excluded_count += 1
 
         self.logger.info(
-            f"🔍 {prefix}: {matched_count}개 매칭, {excluded_count}개 제외, {already_matched_count}개 이미 매칭됨")
+            f"{prefix}: {matched_count}개 매칭, {excluded_count}개 제외, {already_matched_count}개 이미 매칭됨")
         return filtered_streams
 
-    def _matches_container_insights_pattern(self, stream_name: str, prefix: str) -> bool:
-        """로그스트림 이름 패턴에 맞는지 확인합니다 (기존 + Container Insights 패턴)."""
+    def reset_matched_streams(self):
+        """매칭된 스트림 추적을 초기화합니다 (새로운 로그그룹 처리 시 호출)."""
+        self.matched_streams.clear()
 
-        # 1. 기존 정확한 접두사 패턴: kube-proxy-abc123 형태
-        # prefix 뒤에 하이픈이 오고 그 다음에 문자나 숫자가 오고, .log로 끝나는 경우
+    def get_matched_streams(self):
+        """매칭된 스트림 목록을 반환합니다."""
+        return list(self.matched_streams)
+
+    def _matches_stream_pattern(self, stream_name: str, prefix: str) -> bool:
+        """로그스트림 이름 패턴에 맞는지 확인합니다."""
+
+        # 1. 정확한 접두사 패턴: prefix-abc123 형태
         escaped_prefix = re.escape(prefix).replace('\\-', '-').replace('\\_', '_')
         exact_pattern = re.compile(r'^({})-[a-zA-Z0-9]+(\.log)?$'.format(escaped_prefix))
 
         if exact_pattern.match(stream_name):
             return True
 
-        # 2. Container Insights 패턴:
-        # ip-10-0-3-92.ap-northeast-2.compute.internal-dataplane.tail.var.log.containers.kube-proxy-h6msz_kube-system_kube-proxy-...
-        # 패턴: .kube-proxy-h6msz_kube-system_kube-proxy-... 형태에서 두 번째 kube-proxy가 실제 서비스 이름
-        container_insights_pattern = rf'\.{re.escape(prefix)}-[a-zA-Z0-9]+_{re.escape(prefix)}-'
+        # 2. 복잡한 패턴에서 접두사 찾기: 언더스코어와 하이픈으로 구분된 부분들에서 접두사 확인
 
-        if re.search(container_insights_pattern, stream_name):
+        # 언더스코어로 분할하여 각 부분에서 접두사 확인
+        underscore_parts = stream_name.split('_')
+        matching_parts = []
+
+        for part in underscore_parts:
+            # 각 부분에서 접두사로 시작하는지 확인
+            if part.lower().startswith(prefix.lower()):
+                # 접두사 다음에 하이픈이나 언더스코어가 오는 경우만 매칭
+                if len(part) > len(prefix):
+                    next_char = part[len(prefix)]
+                    if next_char in ['-', '_', '.']:
+                        matching_parts.append(part)
+                else:
+                    # 접두사와 정확히 일치하는 경우
+                    matching_parts.append(part)
+
+        # 언더스코어 분할에서 매칭되지 않았다면 하이픈으로도 분할해서 확인
+        if not matching_parts:
+            hyphen_parts = stream_name.split('-')
+            for part in hyphen_parts:
+                # 각 부분에서 접두사로 시작하는지 확인
+                if part.lower().startswith(prefix.lower()):
+                    # 접두사 다음에 하이픈이나 언더스코어가 오는 경우만 매칭
+                    if len(part) > len(prefix):
+                        next_char = part[len(prefix)]
+                        if next_char in ['-', '_', '.']:
+                            matching_parts.append(part)
+                    else:
+                        # 접두사와 정확히 일치하는 경우
+                        matching_parts.append(part)
+
+        # 하나 이상 매칭되는 부분이 있으면 True 반환
+        if matching_parts:
             return True
 
         # 3. 정확한 접두사 매칭: 스트림 이름이 정확히 접두사로 시작하는지 확인
-        # 예: kube-apiserver로 시작하는 스트림만 매칭 (kube-apiserver-audit은 제외)
         if stream_name.lower().startswith(prefix.lower()):
             # 접두사 다음에 하이픈이나 언더스코어가 오는 경우만 매칭
-            # 예: kube-apiserver-xxx (매칭), kube-apiserver-audit-xxx (매칭 안됨)
             if len(stream_name) > len(prefix):
                 next_char = stream_name[len(prefix)]
                 if next_char in ['-', '_', '.']:
@@ -87,15 +120,6 @@ class CloudWatchLogReader:
                 return True
 
         return False
-
-    def _is_container_insights_pattern(self, prefix: str) -> bool:
-        """Container Insights 패턴인지 확인합니다."""
-        # Container Insights에서 사용하는 일반적인 접두사들
-        container_insights_prefixes = [
-            'kube-proxy', 'kube-system', 'kube-apiserver', 'kube-scheduler',
-            'kube-controller-manager', 'authenticator', 'fluentd', 'aws-node'
-        ]
-        return prefix in container_insights_prefixes
 
     def get_log_streams(
         self, log_group_name: str, stream_prefix: str = None,
@@ -114,12 +138,9 @@ class CloudWatchLogReader:
                 'limit': Config.MAX_RESULTS
             }
 
-            # Container Insights 패턴의 경우 logStreamNamePrefix를 사용하지 않음
-            # (스트림 이름이 ip-10-0-3-92... 형태로 시작하기 때문)
-            if stream_prefix and not self._is_container_insights_pattern(stream_prefix):
-                params['logStreamNamePrefix'] = stream_prefix
-            else:
-                # Container Insights 또는 접두사가 없을 때는 정렬 사용
+            # Container Insights의 경우 logStreamNamePrefix가 작동하지 않으므로 모든 스트림을 가져와서 필터링
+            # 접두사가 없을 때만 정렬 사용
+            if not stream_prefix:
                 params['orderBy'] = 'LastEventTime'
                 params['descending'] = True
 
@@ -162,17 +183,20 @@ class CloudWatchLogReader:
             self.logger.error(f"로그스트림 목록 가져오기 실패: {e}")
             return all_streams
 
-    def get_log_events_with_state(
+    def _get_log_events_internal(
         self, log_group_name: str, log_stream_name: str,
         start_time: datetime = None, end_time: datetime = None,
+        is_full_backup: bool = False
     ) -> Generator[Dict[str, Any], None, None]:
-        """상태를 고려하여 특정 로그스트림에서 로그 이벤트를 가져옵니다."""
+        """내부 로그 이벤트 가져오기 메서드 (일반/전체 백업 모드 통합)"""
         try:
             stream_state = self.state_manager.get_stream_state(log_group_name, log_stream_name)
             params = {
                 'logGroupName': log_group_name,
                 'logStreamName': log_stream_name
             }
+
+            backup_prefix = "전체 백업 - " if is_full_backup else ""
 
             # 상태가 있으면 이전 위치부터 읽기 (end_time까지만)
             if stream_state and stream_state.get('next_token'):
@@ -188,7 +212,7 @@ class CloudWatchLogReader:
                     if last_event_dt.date() != start_time.date():
                         use_token = False
                         self.logger.info(
-                            f"날짜 변경 감지: {log_stream_name} "
+                            f"{backup_prefix}날짜 변경 감지: {log_stream_name} "
                             f"(이전: {last_event_dt.date()}, 현재: {start_time.date()}) - 토큰 무시"
                         )
 
@@ -198,27 +222,29 @@ class CloudWatchLogReader:
                     if end_time:
                         params['endTime'] = int(end_time.timestamp() * 1000)
                         self.logger.info(
-                            f"상태 기반 읽기: {log_stream_name} (토큰: {stream_state['next_token'][:20]}..., 종료: {end_time})")
+                            f"{backup_prefix}상태 기반 읽기: {log_stream_name} "
+                            f"(토큰: {stream_state['next_token'][:20]}..., 종료: {end_time})")
                     else:
-                        self.logger.info(f"상태 기반 읽기: {log_stream_name} (토큰: {stream_state['next_token'][:20]}...)")
+                        self.logger.info(
+                            f"{backup_prefix}상태 기반 읽기: {log_stream_name} (토큰: {stream_state['next_token'][:20]}...)")
                 else:
                     # 토큰 무시하고 새로 읽기
                     if start_time:
                         params['startTime'] = int(start_time.timestamp() * 1000)
-                        self.logger.info(f"시작 시간 설정: {start_time} ({params['startTime']})")
+                        self.logger.info(f"{backup_prefix}시작 시간 설정: {start_time} ({params['startTime']})")
                     if end_time:
                         params['endTime'] = int(end_time.timestamp() * 1000)
-                        self.logger.info(f"종료 시간 설정: {end_time} ({params['endTime']})")
-                    self.logger.info(f"토큰 무시하고 새로 읽기 시작: {log_stream_name}")
+                        self.logger.info(f"{backup_prefix}종료 시간 설정: {end_time} ({params['endTime']})")
+                    self.logger.info(f"{backup_prefix}토큰 무시하고 새로 읽기 시작: {log_stream_name}")
             else:
                 # 처음 읽는 경우에만 전체 시간 범위 설정
                 if start_time:
                     params['startTime'] = int(start_time.timestamp() * 1000)
-                    self.logger.info(f"시작 시간 설정: {start_time} ({params['startTime']})")
+                    self.logger.info(f"{backup_prefix}시작 시간 설정: {start_time} ({params['startTime']})")
                 if end_time:
                     params['endTime'] = int(end_time.timestamp() * 1000)
-                    self.logger.info(f"종료 시간 설정: {end_time} ({params['endTime']})")
-                self.logger.info(f"새로 읽기 시작: {log_stream_name}")
+                    self.logger.info(f"{backup_prefix}종료 시간 설정: {end_time} ({params['endTime']})")
+                self.logger.info(f"{backup_prefix}새로 읽기 시작: {log_stream_name}")
 
             last_event_time = None
             next_token = None
@@ -231,7 +257,7 @@ class CloudWatchLogReader:
             while True:
                 iteration_count += 1
                 if iteration_count > max_iterations:
-                    self.logger.warning(f"최대 반복 횟수 초과로 종료: {log_stream_name} (과거 시간 범위)")
+                    self.logger.warning(f"{backup_prefix}최대 반복 횟수 초과로 종료: {log_stream_name}")
                     break
                 try:
                     response = self.client.get_log_events(**params)
@@ -256,21 +282,21 @@ class CloudWatchLogReader:
                         consecutive_empty_responses = 0
 
                     if consecutive_empty_responses >= max_consecutive_empty:
-                        self.logger.info(f"연속 빈 응답으로 종료: {log_stream_name}")
+                        self.logger.info(f"{backup_prefix}연속 빈 응답으로 종료: {log_stream_name}")
                         break
 
                     if next_forward_token == params.get('nextToken'):
-                        self.logger.info(f"토큰 반복으로 종료: {log_stream_name}")
+                        self.logger.info(f"{backup_prefix}토큰 반복으로 종료: {log_stream_name}")
                         break
 
                     next_token = next_forward_token
                     params['nextToken'] = next_token
                 except Exception as api_error:
-                    self.logger.error(f"API 호출 오류: {log_stream_name} - {api_error}")
+                    self.logger.error(f"{backup_prefix}API 호출 오류: {log_stream_name} - {api_error}")
                     break
 
             if total_events > 0:
-                self.logger.info(f"✅ {log_stream_name}: {total_events}개 이벤트 수집")
+                self.logger.info(f"{backup_prefix}{log_stream_name}: {total_events}개 이벤트 수집")
 
             # 상태 업데이트 - 연속 실행을 위해 실제 마지막 이벤트 시간 사용
             if next_token or last_event_time:
@@ -281,15 +307,22 @@ class CloudWatchLogReader:
                     log_group_name, log_stream_name, next_token, state_time_ms
                 )
                 self.logger.info(
-                    f"상태 업데이트 완료: {log_stream_name} (토큰: {next_token[:20] if next_token else 'None'}, "
+                    f"{backup_prefix}상태 업데이트 완료: {log_stream_name} (토큰: {next_token[:20] if next_token else 'None'}, "
                     f"시간: {state_time_ms})")
             else:
-                self.logger.info(f"상태 업데이트 없음: {log_stream_name} (이벤트 없음)")
+                self.logger.info(f"{backup_prefix}상태 업데이트 없음: {log_stream_name} (이벤트 없음)")
 
         except Exception as e:
-            self.logger.error(f"로그 이벤트 가져오기 실패: {log_stream_name} - {e}")
+            self.logger.error(f"{backup_prefix}로그 이벤트 가져오기 실패: {log_stream_name} - {e}")
             import traceback
             self.logger.error(f"스택 트레이스: {traceback.format_exc()}")
+
+    def get_log_events_with_state(
+        self, log_group_name: str, log_stream_name: str,
+        start_time: datetime = None, end_time: datetime = None,
+    ) -> Generator[Dict[str, Any], None, None]:
+        """상태를 고려하여 특정 로그스트림에서 로그 이벤트를 가져옵니다."""
+        return self._get_log_events_internal(log_group_name, log_stream_name, start_time, end_time, False)
 
     def get_all_logs_with_state(
         self, log_group_name: str, stream_prefix: str = None,
@@ -301,7 +334,7 @@ class CloudWatchLogReader:
 
         # 시간 범위를 get_log_streams에 전달하여 초기 필터링
         log_streams = self.get_log_streams(log_group_name, stream_prefix, start_time, end_time)
-        self.logger.info(f"📋 {len(log_streams)}개 스트림 발견: {stream_prefix or 'all'}")
+        self.logger.info(f"{len(log_streams)}개 스트림 발견: {stream_prefix or 'all'}")
 
         for i, stream in enumerate(log_streams, 1):
             stream_name = stream['logStreamName']
@@ -336,3 +369,48 @@ class CloudWatchLogReader:
     ) -> List[Dict[str, Any]]:
         """기존 메서드 (하위 호환성 유지)"""
         return self.get_all_logs_with_state(log_group_name, stream_prefix, start_time, end_time)
+
+    def get_log_streams_for_full_backup(
+        self, log_group_name: str, stream_prefix: str = None
+    ) -> List[Dict[str, Any]]:
+        """전체 백업을 위한 로그스트림 목록을 가져옵니다 (시간 범위 무시)."""
+        return self.get_log_streams(log_group_name, stream_prefix, None, None)
+
+    def get_log_events_for_full_backup(
+        self, log_group_name: str, log_stream_name: str,
+        start_time: datetime = None, end_time: datetime = None,
+    ) -> Generator[Dict[str, Any], None, None]:
+        """전체 백업을 위한 로그 이벤트를 가져옵니다 (State 기반, MINUTES_BACK 기반)."""
+        return self._get_log_events_internal(log_group_name, log_stream_name, start_time, end_time, True)
+
+    def get_all_logs_for_full_backup(
+        self, log_group_name: str, stream_prefix: str = None,
+        start_time: datetime = None, end_time: datetime = None,
+    ) -> List[Dict[str, Any]]:
+        """전체 백업을 위한 모든 로그스트림에서 로그를 가져옵니다 (MINUTES_BACK 기반)."""
+        all_logs = []
+        active_streams = []
+
+        # 전체 백업용 로그스트림 목록 가져오기 (시간 범위 무시)
+        log_streams = self.get_log_streams_for_full_backup(log_group_name, stream_prefix)
+        self.logger.info(f"전체 백업용 {len(log_streams)}개 스트림 발견: {stream_prefix or 'all'}")
+
+        for i, stream in enumerate(log_streams, 1):
+            stream_name = stream['logStreamName']
+            active_streams.append(stream_name)
+
+            stored_bytes = stream.get('storedBytes', 0)
+            if stored_bytes == 0:
+                self.logger.debug(f"빈 스트림 스킵: {stream_name}")
+
+            stream_event_count = 0
+            for event in self.get_log_events_for_full_backup(log_group_name, stream_name, start_time, end_time):
+                all_logs.append(event)
+                stream_event_count += 1
+
+        if all_logs:
+            self.logger.info(f"전체 백업 - {stream_prefix or 'all'}: 총 {len(all_logs)}개 로그 이벤트 수집 완료")
+        else:
+            self.logger.warning(f"전체 백업 - {stream_prefix or 'all'}: 수집된 로그 없음")
+
+        return all_logs

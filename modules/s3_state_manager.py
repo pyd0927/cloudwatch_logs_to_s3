@@ -289,11 +289,8 @@ class S3StateManager:
 
             streams_to_remove = []
             for stream_name, stream_state in state['streams'].items():
-                # 활성 스트림이 아니거나 오래된 경우 제거
-                if (
-                    stream_name not in active_streams
-                    or self._is_stream_old(stream_state, current_time, max_age_hours)
-                ):
+                # 오래된 스트림만 제거 (활성 스트림 여부는 무시)
+                if self._is_stream_old(stream_state, current_time, max_age_hours):
                     streams_to_remove.append(stream_name)
 
             for stream_name in streams_to_remove:

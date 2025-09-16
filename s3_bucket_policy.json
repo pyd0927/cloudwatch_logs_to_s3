@@ -5,44 +5,44 @@
             "Sid": "AllowLambdaToPutObjects",
             "Effect": "Allow",
             "Principal": {
-                "AWS": "arn:aws:iam::447659471488:role/CloudWatchLogToS3Role"
+                "AWS": "arn:aws:iam::${AWS_ACCOUNT_ID}:role/CloudWatchLogToS3Role"
             },
             "Action": [
                 "s3:PutObject",
                 "s3:PutObjectAcl"
             ],
-            "Resource": "arn:aws:s3:::willpark-log-test-s3/*"
+            "Resource": "arn:aws:s3:::${S3_BUCKET_NAME}/*"
         },
         {
             "Sid": "AllowLambdaToListBucket",
             "Effect": "Allow",
             "Principal": {
-                "AWS": "arn:aws:iam::447659471488:role/CloudWatchLogToS3Role"
+                "AWS": "arn:aws:iam::${AWS_ACCOUNT_ID}:role/CloudWatchLogToS3Role"
             },
             "Action": [
                 "s3:ListBucket",
                 "s3:GetBucketLocation"
             ],
-            "Resource": "arn:aws:s3:::willpark-log-test-s3"
+            "Resource": "arn:aws:s3:::${S3_BUCKET_NAME}"
         },
         {
             "Sid": "AllowLambdaToDeleteObjects",
             "Effect": "Allow",
             "Principal": {
-                "AWS": "arn:aws:iam::447659471488:role/CloudWatchLogToS3Role"
+                "AWS": "arn:aws:iam::${AWS_ACCOUNT_ID}:role/CloudWatchLogToS3Role"
             },
             "Action": [
                 "s3:DeleteObject",
                 "s3:DeleteObjectVersion"
             ],
-            "Resource": "arn:aws:s3:::willpark-log-test-s3/*"
+            "Resource": "arn:aws:s3:::${S3_BUCKET_NAME}/*"
         },
         {
             "Sid": "DenyUnencryptedObjectUploads",
             "Effect": "Deny",
             "Principal": "*",
             "Action": "s3:PutObject",
-            "Resource": "arn:aws:s3:::willpark-log-test-s3/*",
+            "Resource": "arn:aws:s3:::${S3_BUCKET_NAME}/*",
             "Condition": {
                 "StringNotEquals": {
                     "s3:x-amz-server-side-encryption": "AES256"
@@ -54,7 +54,7 @@
             "Effect": "Deny",
             "Principal": "*",
             "Action": "s3:PutObject",
-            "Resource": "arn:aws:s3:::willpark-log-test-s3/*",
+            "Resource": "arn:aws:s3:::${S3_BUCKET_NAME}/*",
             "Condition": {
                 "StringNotEquals": {
                     "s3:x-amz-server-side-encryption": "AES256"
@@ -66,7 +66,7 @@
             "Effect": "Deny",
             "Principal": "*",
             "Action": "s3:PutObject",
-            "Resource": "arn:aws:s3:::willpark-log-test-s3/*",
+            "Resource": "arn:aws:s3:::${S3_BUCKET_NAME}/*",
             "Condition": {
                 "Null": {
                     "s3:x-amz-server-side-encryption": "true"

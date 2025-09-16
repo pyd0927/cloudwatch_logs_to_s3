@@ -8,6 +8,7 @@ from .log_compressor import LogCompressor
 from .s3_uploader import S3Uploader
 from .s3_state_manager import S3StateManager
 import json
+import dateutil.parser
 
 
 class BatchProcessor:
@@ -29,10 +30,13 @@ class BatchProcessor:
         """단일 로그그룹을 처리합니다."""
         log_group_name = config['log_group_name']
         stream_prefixes = config['stream_prefixes']
+        full_backup = config.get('full_backup', False)
+        retention_day = config.get('retention_day')
 
         result = {
             'log_group_name': log_group_name,
             'stream_prefixes': stream_prefixes,
+            'full_backup': full_backup,
             'success': False,
             'logs_count': 0,
             'uploaded_files': [],
@@ -40,10 +44,52 @@ class BatchProcessor:
         }
 
         try:
-            self.logger.info(f"로그그룹 처리: {log_group_name}")
+            # S3에서 상태 로드
+            state = self.state_manager.load_state(log_group_name)
+            last_read_time = state.get('last_read_time')
+            last_run_time = state.get('last_run_time')
+
+            # 문자열을 datetime 객체로 변환
+            if last_read_time and isinstance(last_read_time, str):
+                last_read_time = dateutil.parser.parse(last_read_time)
+            if last_run_time and isinstance(last_run_time, str):
+                last_run_time = dateutil.parser.parse(last_run_time)
+
+            if full_backup:
+                self.logger.info(f"전체 백업 모드 - 로그그룹 처리: {log_group_name}")
+                # 전체 백업 모드에서는 retention_day=-1으로 전달하여 전체 백업 모드로 처리
+                actual_start_time, actual_end_time = Config.get_time_range(
+                    log_group_name, retention_day=-1, last_read_time=last_read_time, last_run_time=last_run_time
+                )
+                self.logger.info(f"전체 백업 모드 - 시간 범위 계산 결과: {actual_start_time} ~ {actual_end_time}")
+                # end_time을 actual_end_time으로 업데이트
+                end_time = actual_end_time
+            else:
+                self.logger.info(f"로그그룹 처리: {log_group_name}")
+                # 일반 모드에서도 Config.get_time_range를 호출하여 State 파일 기반 시간 범위 계산
+                actual_start_time, actual_end_time = Config.get_time_range(
+                    log_group_name,
+                    retention_day=retention_day,
+                    last_read_time=last_read_time,
+                    last_run_time=last_run_time
+                )
+                self.logger.info(f"일반 모드 - 시간 범위 계산 결과: {actual_start_time} ~ {actual_end_time}")
+                # end_time을 actual_end_time으로 업데이트
+                end_time = actual_end_time
+
+            # 시간 범위가 None인 경우 (State 파일의 last_read_time보다 이전인 경우) 로그를 읽지 않음
+            if actual_start_time is None or actual_end_time is None:
+                self.logger.warning(f"시간 범위가 None입니다. 로그를 읽지 않고 건너뜁니다: {log_group_name}")
+                result['success'] = True
+                result['logs_count'] = 0
+                result['uploaded_files'] = []
+                result['error'] = None
+                return result
 
             all_logs = []
             all_active_streams = []
+            streams_processed = False  # 스트림을 처리했는지 여부
+            any_streams_found = False  # 어떤 접두사에서든 스트림이 발견되었는지 여부
 
             # 접두사를 길이 순으로 정렬 (긴 접두사부터 처리하여 정확한 매칭)
             sorted_prefixes = sorted(stream_prefixes, key=len, reverse=True)
@@ -52,15 +98,55 @@ class BatchProcessor:
             for stream_prefix in sorted_prefixes:
                 # CloudWatch에서 로그 가져오기
                 reader = CloudWatchLogReader(state_manager=self.state_manager)
+                # 새로운 로그그룹 처리 시 매칭된 스트림 추적 초기화
+                reader.reset_matched_streams()
 
-                logs = reader.get_all_logs_with_state(
-                    log_group_name, stream_prefix, start_time, end_time
-                )
+                if full_backup:
+                    # 전체 백업 모드: MINUTES_BACK 기반으로 시간 범위 설정하여 읽기
+                    logs = reader.get_all_logs_for_full_backup(
+                        log_group_name, stream_prefix, actual_start_time, actual_end_time
+                    )
 
-                # 활성 스트림 수집 (로그가 없어도 스트림 자체는 활성으로 간주)
-                for stream in reader.get_log_streams(log_group_name, stream_prefix, start_time, end_time):
-                    if stream['logStreamName'] not in all_active_streams:
-                        all_active_streams.append(stream['logStreamName'])
+                    # 활성 스트림 수집 (시간 범위 무시)
+                    streams = reader.get_log_streams_for_full_backup(log_group_name, stream_prefix)
+                    for stream in streams:
+                        if stream['logStreamName'] not in all_active_streams:
+                            all_active_streams.append(stream['logStreamName'])
+
+                    # matched_streams에서도 활성 스트림 수집 (이미 처리된 스트림도 활성으로 간주)
+                    matched_streams = reader.get_matched_streams()
+                    for stream_name in matched_streams:
+                        if stream_name not in all_active_streams:
+                            all_active_streams.append(stream_name)
+
+                    # 스트림이 존재하면 처리됨으로 표시 (로그가 없어도 시간 진행)
+                    if streams or len(matched_streams) > 0:
+                        streams_processed = True
+                        any_streams_found = True
+                else:
+                    # 기존 모드: 시간 범위 기반으로 로그 읽기
+                    logs = reader.get_all_logs_with_state(
+                        log_group_name, stream_prefix, actual_start_time, actual_end_time
+                    )
+
+                    # 활성 스트림 수집 (로그가 없어도 스트림 자체는 활성으로 간주)
+                    streams = reader.get_log_streams(
+                        log_group_name, stream_prefix, actual_start_time, actual_end_time
+                    )
+                    for stream in streams:
+                        if stream['logStreamName'] not in all_active_streams:
+                            all_active_streams.append(stream['logStreamName'])
+
+                    # matched_streams에서도 활성 스트림 수집 (이미 처리된 스트림도 활성으로 간주)
+                    matched_streams = reader.get_matched_streams()
+                    for stream_name in matched_streams:
+                        if stream_name not in all_active_streams:
+                            all_active_streams.append(stream_name)
+
+                    # 스트림이 존재하면 처리됨으로 표시 (로그가 없어도 시간 진행)
+                    if streams or len(matched_streams) > 0:
+                        streams_processed = True
+                        any_streams_found = True
 
                 if logs:
                     # 스트림별로 로그를 그룹핑
@@ -74,8 +160,8 @@ class BatchProcessor:
 
                     self.logger.info(f"{stream_prefix}: {len(logs_by_stream)}개 스트림에서 총 {len(logs)}개 로그 수집")
 
-                    # LOG_STREAM_PREFIX별로 하나의 파일 생성 (모든 스트림의 로그를 합침)
-                    s3_key = Config.get_s3_key(log_group_name, start_time, end_time, stream_prefix)
+                    # S3 키 생성
+                    s3_key = Config.get_s3_key(log_group_name, actual_start_time, actual_end_time, stream_prefix)
 
                     # 로그 압축 (모든 스트림의 로그를 하나로 합쳐서 압축)
                     compressed_data = self.compressor.compress_logs(
@@ -116,21 +202,25 @@ class BatchProcessor:
                             'compression_ratio': round(compression_ratio, 1)
                         })
                         self.logger.info(
-                            f"✅ {stream_prefix}: {len(logs)}개 → S3 업로드 완료 ({compression_ratio:.1f}% 압축)")
+                            f"{stream_prefix}: {len(logs)}개 → S3 업로드 완료 ({compression_ratio:.1f}% 압축)")
                     else:
-                        self.logger.error(f"❌ {stream_prefix}: S3 업로드 실패")
+                        self.logger.error(f"{stream_prefix}: S3 업로드 실패")
                 else:
-                    self.logger.warning(f"⚠️ {stream_prefix}: 수집된 로그 없음")
+                    self.logger.warning(f"{stream_prefix}: 수집된 로그 없음")
 
                 all_logs.extend(logs)
 
             result['logs_count'] = len(all_logs)
             result['success'] = len(result['uploaded_files']) > 0
 
+            # 성공하지 않은 경우 error를 명확히 설정
+            if not result['success']:
+                result['error'] = "수집된 로그가 없습니다"
+
             if result['success']:
                 log_count = result['logs_count']
                 file_count = len(result['uploaded_files'])
-                self.logger.info(f"✅ 완료: {log_group_name}")
+                self.logger.info(f"완료: {log_group_name}")
                 self.logger.info(f"   총 {log_count}개 로그 → {file_count}개 파일 업로드")
 
                 # 업로드된 파일 목록 표시
@@ -139,12 +229,27 @@ class BatchProcessor:
 
             # 모든 스트림을 활성 스트림으로 정리
             self.state_manager.cleanup_old_streams(log_group_name, all_active_streams)
-            self.state_manager.update_last_read_time(log_group_name, end_time)
+
+            # 스트림을 처리했거나 로그를 수집했으면 last_read_time 업데이트
+            # 단, 시간 범위가 None인 경우 (State 파일의 last_read_time보다 이전인 경우)는 업데이트하지 않음
+            if actual_start_time is not None and actual_end_time is not None:
+                if streams_processed or any_streams_found or len(all_active_streams) > 0 or len(all_logs) > 0:
+                    if end_time is not None:
+                        self.state_manager.update_last_read_time(log_group_name, end_time)
+                        self.logger.info(f"스트림 처리 완료 - last_read_time 업데이트: {end_time}")
+                    else:
+                        self.logger.warning("end_time이 None이므로 last_read_time 업데이트 안함")
+                else:
+                    self.logger.warning("처리할 스트림이 없음 - last_read_time 업데이트 안함")
+            else:
+                self.logger.warning("시간 범위가 None이므로 last_read_time 업데이트 안함")
+
             self.state_manager.update_last_run_time(log_group_name)
 
         except Exception as e:
-            result['error'] = str(e)
-            self.logger.error(f"❌ 처리 오류: {log_group_name} - {e}")
+            error_msg = str(e) if e else "알 수 없는 오류"
+            result['error'] = error_msg
+            self.logger.error(f"처리 오류: {log_group_name} - {error_msg}")
             import traceback
             self.logger.error(f"스택 트레이스: {traceback.format_exc()}")
 
@@ -173,8 +278,12 @@ class BatchProcessor:
                 # 각 로그그룹별로 개별 시간 범위 계산
                 log_group_name = config['log_group_name']
                 retention_day = config.get('retention_day')
+                full_backup = config.get('full_backup', False)
 
-                if start_time is None or end_time is None:
+                # 전체 백업 모드일 때는 전역 시간 범위 계산을 건너뛰고 None으로 설정
+                if full_backup:
+                    group_start_time, group_end_time = None, None
+                elif start_time is None or end_time is None:
                     # 상태 관리에서 마지막 읽은 시간과 실행 시간 가져오기
                     last_read_time = None
                     last_run_time = None
