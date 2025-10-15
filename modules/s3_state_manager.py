@@ -10,47 +10,58 @@ from .config import Config
 class S3StateManager:
     """S3에 로그 읽기 상태를 저장하는 클래스"""
 
-    def __init__(self, bucket_name: str = None, state_key: str = None):
+    def __init__(self, bucket_name: str = None, state_prefix: str = None):
         self.bucket_name = bucket_name or Config.S3_BUCKET_NAME
-        self.state_key = state_key or Config.S3_STATE_KEY
+        self.state_prefix = state_prefix or Config.S3_STATE_PREFIX
         self.logger = logging.getLogger(__name__)
         self.s3_client = boto3.client('s3', region_name=Config.REGION)
 
-        # 상태 캐시 (메모리에서 중복 S3 호출 방지)
-        self._state_cache = {}
-        self._cache_timestamp = None
+        # 상태 캐시 (메모리에서 중복 S3 호출 방지) - 로그그룹별로 관리
+        self._state_cache = {}  # {log_group_name: state_data}
+        self._cache_timestamp = {}  # {log_group_name: timestamp}
         self._cache_ttl_seconds = 60  # 1분 캐시
 
-    def _is_cache_valid(self) -> bool:
-        """캐시가 유효한지 확인합니다."""
-        if not self._cache_timestamp:
+        # 마이그레이션 실행 (한 번만)
+        self._migrate_legacy_state()
+
+    def _get_state_key_for_log_group(self, log_group_name: str) -> str:
+        """로그그룹별 State 파일 키를 생성합니다."""
+        # 로그그룹명에서 '/' 제거하여 S3 키 생성
+        clean_name = log_group_name.replace('/', '_')
+        return f"{self.state_prefix}/{clean_name}/state.json"
+
+    def _is_cache_valid(self, log_group_name: str) -> bool:
+        """특정 로그그룹의 캐시가 유효한지 확인합니다."""
+        if log_group_name not in self._cache_timestamp:
             return False
 
-        cache_age = (datetime.now(timezone.utc) - self._cache_timestamp).total_seconds()
+        cache_age = (datetime.now(timezone.utc) - self._cache_timestamp[log_group_name]).total_seconds()
         return cache_age < self._cache_ttl_seconds
 
-    def _load_from_s3(self) -> Dict[str, Any]:
-        """S3에서 전체 상태를 로드합니다."""
+    def _load_from_s3(self, log_group_name: str) -> Dict[str, Any]:
+        """S3에서 특정 로그그룹의 상태를 로드합니다."""
+        state_key = self._get_state_key_for_log_group(log_group_name)
+
         try:
             response = self.s3_client.get_object(
                 Bucket=self.bucket_name,
-                Key=self.state_key
+                Key=state_key
             )
 
             content = response['Body'].read().decode('utf-8')
             state_data = json.loads(content)
 
             # 캐시 업데이트
-            self._state_cache = state_data
-            self._cache_timestamp = datetime.now(timezone.utc)
+            self._state_cache[log_group_name] = state_data
+            self._cache_timestamp[log_group_name] = datetime.now(timezone.utc)
 
-            self.logger.info(f"S3 상태 로드 완료(s3://{self.bucket_name}/{self.state_key}): {len(state_data)}개 로그그룹")
+            self.logger.info(f"S3 상태 로드 완료(s3://{self.bucket_name}/{state_key})")
             return state_data
 
         except ClientError as e:
             error_code = e.response['Error']['Code']
             if error_code == 'NoSuchKey':
-                self.logger.info("S3 상태 파일이 존재하지 않음. 새로 생성합니다.")
+                self.logger.info(f"S3 상태 파일이 존재하지 않음: {log_group_name}. 새로 생성합니다.")
                 return {}
             elif error_code == 'NoSuchBucket':
                 self.logger.error(f"S3 버킷이 존재하지 않습니다: {self.bucket_name}")
@@ -65,14 +76,16 @@ class S3StateManager:
             self.logger.error(f"예상치 못한 S3 로드 오류: {e}")
             return {}
 
-    def _save_to_s3(self, state_data: Dict[str, Any]) -> bool:
-        """S3에 전체 상태를 저장합니다."""
+    def _save_to_s3(self, log_group_name: str, state_data: Dict[str, Any]) -> bool:
+        """S3에 특정 로그그룹의 상태를 저장합니다."""
+        state_key = self._get_state_key_for_log_group(log_group_name)
+
         try:
             # 메타데이터 추가
             metadata = {
                 'last_updated': datetime.now(timezone.utc).isoformat(),
-                'log_groups_count': str(len(state_data)),
-                'manager_version': '2.0'
+                'log_group_name': log_group_name,
+                'manager_version': '3.0'
             }
 
             json_content = json.dumps(
@@ -84,7 +97,7 @@ class S3StateManager:
 
             self.s3_client.put_object(
                 Bucket=self.bucket_name,
-                Key=self.state_key,
+                Key=state_key,
                 Body=json_content.encode('utf-8'),
                 ContentType='application/json',
                 ServerSideEncryption='AES256',
@@ -92,10 +105,10 @@ class S3StateManager:
             )
 
             # 캐시 업데이트
-            self._state_cache = state_data
-            self._cache_timestamp = datetime.now(timezone.utc)
+            self._state_cache[log_group_name] = state_data
+            self._cache_timestamp[log_group_name] = datetime.now(timezone.utc)
 
-            self.logger.info(f"S3 상태 저장 완료: {len(state_data)}개 로그그룹")
+            self.logger.info(f"S3 상태 저장 완료: {log_group_name}")
             return True
 
         except ClientError as e:
@@ -105,19 +118,80 @@ class S3StateManager:
             self.logger.error(f"예상치 못한 S3 저장 오류: {e}")
             return False
 
+    def _migrate_legacy_state(self) -> bool:
+        """기존 통합 State 파일을 개별 파일로 마이그레이션합니다."""
+        legacy_state_key = f"{self.state_prefix}/state.json"
+
+        try:
+            # 기존 통합 State 파일 존재 확인
+            self.s3_client.head_object(Bucket=self.bucket_name, Key=legacy_state_key)
+            self.logger.info("기존 통합 State 파일 발견. 마이그레이션을 시작합니다.")
+
+            # 기존 파일 로드
+            response = self.s3_client.get_object(Bucket=self.bucket_name, Key=legacy_state_key)
+            content = response['Body'].read().decode('utf-8')
+            legacy_data = json.loads(content)
+
+            if not isinstance(legacy_data, dict):
+                self.logger.warning("기존 State 파일 형식이 올바르지 않습니다. 마이그레이션을 건너뜁니다.")
+                return False
+
+            # 각 로그그룹별로 개별 파일 생성
+            migrated_count = 0
+            for log_group_name, state_data in legacy_data.items():
+                if isinstance(state_data, dict) and 'log_group_name' in state_data:
+                    success = self._save_to_s3(log_group_name, state_data)
+                    if success:
+                        migrated_count += 1
+                        self.logger.info(f"마이그레이션 완료: {log_group_name}")
+                    else:
+                        self.logger.error(f"마이그레이션 실패: {log_group_name}")
+
+            if migrated_count > 0:
+                # 기존 파일 삭제
+                self.s3_client.delete_object(Bucket=self.bucket_name, Key=legacy_state_key)
+                self.logger.info(f"마이그레이션 완료: {migrated_count}개 로그그룹, 기존 파일 삭제됨")
+                return True
+            else:
+                self.logger.warning("마이그레이션할 유효한 데이터가 없습니다.")
+                return False
+
+        except ClientError as e:
+            error_code = e.response['Error']['Code']
+            if error_code in ['NoSuchKey', '404']:
+                # 기존 파일이 없으면 마이그레이션 불필요 (정상 상황)
+                self.logger.warning("기존 통합 State 파일이 없습니다. 마이그레이션을 건너뜁니다.")
+                return True
+            else:
+                self.logger.error(f"마이그레이션 중 오류 발생: {e}")
+                return False
+        except Exception as e:
+            # 404 오류가 ClientError로 잡히지 않는 경우를 대비
+            error_str = str(e)
+            if '404' in error_str or 'Not Found' in error_str:
+                # 기존 파일이 없으면 마이그레이션 불필요 (정상 상황)
+                self.logger.warning("기존 통합 State 파일이 없습니다. 마이그레이션을 건너뜁니다.")
+                return True
+            else:
+                self.logger.error(f"마이그레이션 중 예상치 못한 오류: {e}")
+                return False
+
     def load_state(self, log_group_name: str) -> Dict[str, Any]:
         """특정 로그그룹의 상태를 로드합니다."""
         try:
             # 캐시에서 먼저 확인
-            if self._is_cache_valid() and self._state_cache:
-                state_data = self._state_cache
+            if self._is_cache_valid(log_group_name) and log_group_name in self._state_cache:
+                state_data = self._state_cache[log_group_name]
                 self.logger.debug(f"캐시에서 상태 로드: {log_group_name}")
             else:
                 # S3에서 로드
-                state_data = self._load_from_s3()
+                state_data = self._load_from_s3(log_group_name)
 
-            # 해당 로그그룹의 상태 반환
-            return state_data.get(log_group_name, self._get_default_state(log_group_name))
+            # 상태가 비어있으면 기본 상태 반환
+            if not state_data:
+                return self._get_default_state(log_group_name)
+
+            return state_data
 
         except Exception as e:
             self.logger.error(f"상태 로드 실패: {e}")
@@ -126,17 +200,8 @@ class S3StateManager:
     def save_state(self, log_group_name: str, state: Dict[str, Any]) -> bool:
         """특정 로그그룹의 상태를 저장합니다."""
         try:
-            # 현재 전체 상태 로드
-            if self._is_cache_valid() and self._state_cache:
-                all_states = self._state_cache.copy()
-            else:
-                all_states = self._load_from_s3()
-
-            # 해당 로그그룹의 상태 업데이트
-            all_states[log_group_name] = state
-
             # S3에 저장
-            success = self._save_to_s3(all_states)
+            success = self._save_to_s3(log_group_name, state)
 
             if success:
                 self.logger.info(f"상태 저장 완료: {log_group_name}")
@@ -323,32 +388,36 @@ class S3StateManager:
         except Exception:
             return True
 
-    def get_state_info(self) -> Dict[str, Any]:
-        """상태 파일 정보를 반환합니다."""
+    def get_state_info(self, log_group_name: str) -> Dict[str, Any]:
+        """특정 로그그룹의 상태 파일 정보를 반환합니다."""
+        state_key = self._get_state_key_for_log_group(log_group_name)
+
         try:
             # S3 객체 메타데이터 확인
             response = self.s3_client.head_object(
                 Bucket=self.bucket_name,
-                Key=self.state_key
+                Key=state_key
             )
 
             return {
                 'bucket': self.bucket_name,
-                'key': self.state_key,
+                'key': state_key,
+                'log_group_name': log_group_name,
                 'size': response.get('ContentLength', 0),
                 'last_modified': response.get('LastModified'),
                 'metadata': response.get('Metadata', {}),
-                'cache_valid': self._is_cache_valid(),
-                'cache_timestamp': self._cache_timestamp
+                'cache_valid': self._is_cache_valid(log_group_name),
+                'cache_timestamp': self._cache_timestamp.get(log_group_name)
             }
 
         except ClientError as e:
             if e.response['Error']['Code'] == 'NoSuchKey':
                 return {
                     'bucket': self.bucket_name,
-                    'key': self.state_key,
+                    'key': state_key,
+                    'log_group_name': log_group_name,
                     'exists': False,
-                    'cache_valid': self._is_cache_valid()
+                    'cache_valid': self._is_cache_valid(log_group_name)
                 }
             else:
                 raise
@@ -359,18 +428,27 @@ class S3StateManager:
             # 버킷 존재 확인
             self.s3_client.head_bucket(Bucket=self.bucket_name)
 
-            # 상태 파일 읽기 시도
+            # State 디렉토리에 테스트 파일 생성/삭제로 쓰기 권한 확인
+            test_key = f"{self.state_prefix}/.test_access"
             try:
-                self._load_from_s3()
+                # 테스트 파일 생성
+                self.s3_client.put_object(
+                    Bucket=self.bucket_name,
+                    Key=test_key,
+                    Body=b'test',
+                    ContentType='text/plain',
+                    ServerSideEncryption='AES256'
+                )
+
+                # 테스트 파일 삭제
+                self.s3_client.delete_object(Bucket=self.bucket_name, Key=test_key)
+
                 self.logger.info(f"S3 접근 권한 확인 완료: {self.bucket_name}")
                 return True
+
             except ClientError as e:
-                if e.response['Error']['Code'] == 'NoSuchKey':
-                    # 파일이 없는 것은 정상 (처음 실행)
-                    self.logger.info(f"S3 접근 권한 확인 완료 (파일 없음): {self.bucket_name}")
-                    return True
-                else:
-                    raise
+                self.logger.error(f"S3 쓰기 권한 확인 실패: {e}")
+                return False
 
         except ClientError as e:
             self.logger.error(f"S3 접근 권한 확인 실패: {e}")

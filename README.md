@@ -6,7 +6,7 @@ AWS CloudWatch Log의 특정 로그그룹에서 로그스트림을 읽어서 압
 
 - **Retention 기반 시간 범위 계산**: CloudWatch Log Group의 Retention 설정을 기반으로 삭제 직전 구간 백업
 - **전체 백업 모드**: Retention 설정을 무시하고 가장 오래된 로그부터 전체 백업
-- **상태 관리**: S3에 상태 파일을 저장하여 연속적인 로그 수집 및 누락 방지
+- **상태 관리**: S3에 로그그룹별 개별 상태 파일을 저장하여 연속적인 로그 수집 및 누락 방지
 - **시간 범위 검증**: State 파일 기반으로 중복 로그 수집 방지
 - **배치 처리**: 여러 로그그룹을 동시에 처리
 - **멀티스레딩**: Python ThreadPoolExecutor를 활용한 성능 최적화
@@ -160,6 +160,9 @@ MAX_WORKERS="4"  # 기본값: 4
 
 # S3 상태 관리 사용 여부
 USE_S3_STATE="true"  # 기본값: true
+
+# S3 상태 파일 저장 경로 (로그그룹별 개별 파일)
+S3_STATE_PREFIX="CloudWatchLogsState"  # 기본값: CloudWatchLogsState
 ```
 
 ## 🔄 Retention 기반 시간 범위 계산
@@ -285,7 +288,12 @@ CloudWatchLogs/
 │       └── 2025/01/20/
 │           └── 20250120_093000_123_20250120_100000_456.log.gz
 └── CloudWatchLogsState/
-    └── state.json
+    ├── _aws_eks_cluster-name_cluster/
+    │   └── state.json
+    ├── _aws_lambda_another-function/
+    │   └── state.json
+    └── _aws_containerinsights_cluster-name_dataplane/
+        └── state.json
 ```
 
 ## 🔧 Lambda 함수 사용법
@@ -318,27 +326,41 @@ cat test-response.json
 
 ## 🔍 상태 관리
 
-### S3 상태 파일 구조
+### 로그그룹별 개별 State 파일 관리
+
+각 로그그룹마다 독립적인 State 파일을 관리하여 성능과 확장성을 향상시켰습니다.
+
+#### State 파일 구조
+**파일 경로**: `CloudWatchLogsState/{log_group_name}/state.json`
+
+**예시**: `CloudWatchLogsState/_aws_eks_cluster-name_cluster/state.json`
 ```json
 {
-  "/aws/eks/cluster-name/cluster": {
-    "log_group_name": "/aws/eks/cluster-name/cluster",
-    "last_run_time": "2025-01-20T10:00:00.000000+00:00",
-    "last_read_time": "2025-01-14T10:00:00.000000+00:00",
-    "streams": {
-      "kube-apiserver-abc123": {
-        "next_token": "f/1234567890...",
-        "last_event_time": 1705233600000,
-        "last_updated": "2025-01-20T10:00:00.000000+00:00"
-      }
-    },
-    "created_at": "2025-01-20T09:30:00.000000+00:00",
-    "state_version": "2.0"
-  }
+  "log_group_name": "/aws/eks/cluster-name/cluster",
+  "last_run_time": "2025-01-20T10:00:00.000000+00:00",
+  "last_read_time": "2025-01-14T10:00:00.000000+00:00",
+  "streams": {
+    "kube-apiserver-abc123": {
+      "next_token": "f/1234567890...",
+      "last_event_time": 1705233600000,
+      "last_updated": "2025-01-20T10:00:00.000000+00:00"
+    }
+  },
+  "created_at": "2025-01-20T09:30:00.000000+00:00",
+  "state_version": "3.0"
 }
 ```
 
+#### 자동 마이그레이션
+기존 통합 State 파일(`CloudWatchLogsState/state.json`)이 있는 경우 자동으로 로그그룹별 개별 파일로 분리합니다:
+- 기존 파일 로드 → 각 로그그룹별로 개별 파일 생성 → 기존 파일 삭제
+- 마이그레이션은 한 번만 실행되며, 파일이 없는 경우 정상적으로 건너뜁니다
+
 ### 상태 관리 기능
+- **로그그룹별 독립 관리**: 각 로그그룹의 State를 독립적으로 로드/저장
+- **성능 최적화**: 필요한 로그그룹의 State만 로드하여 성능 향상
+- **확장성**: 로그그룹 추가/제거 시 다른 그룹에 영향 없음
+- **멀티스레딩 안전**: 로그그룹별 독립적 State 관리로 동시성 문제 해결
 - **연속 읽기**: `last_read_time`을 기준으로 이어서 읽기
 - **스트림별 추적**: 각 로그스트림의 마지막 이벤트 시간 및 토큰 관리
 - **시간 범위 검증**: State 파일의 `last_read_time`과 계산된 시간 범위를 비교하여 중복 수집 방지
@@ -377,8 +399,8 @@ aws lambda get-function --function-name cloudwatch-log-to-s3
 # Layer 정보 확인
 aws lambda list-layer-versions --layer-name cloudwatch-log-to-s3-dependencies
 
-# S3 상태 파일 확인
-aws s3 cp s3://your-bucket/CloudWatchLogsState/state.json -
+# S3 상태 파일 확인 (로그그룹별 개별 파일)
+aws s3 cp s3://your-bucket/CloudWatchLogsState/_aws_eks_cluster-name_cluster/state.json -
 
 # CloudWatch Logs 확인
 aws logs describe-log-groups --log-group-name-prefix "/aws/eks"
@@ -392,8 +414,11 @@ aws lambda invoke \
     --payload '{"type": "test"}' \
     test-response.json
 
-# 전체 백업 모드 상태 확인
-aws s3 cp s3://your-bucket/CloudWatchLogsState/state.json - | jq '.["/aws/containerinsights/cluster-name/dataplane"]'
+# 전체 백업 모드 상태 확인 (로그그룹별 개별 파일)
+aws s3 cp s3://your-bucket/CloudWatchLogsState/_aws_containerinsights_cluster-name_dataplane/state.json -
+
+# 모든 State 파일 목록 확인
+aws s3 ls s3://your-bucket/CloudWatchLogsState/ --recursive
 
 # 시간 범위 검증 로그 확인
 aws logs filter-log-events \
@@ -408,7 +433,15 @@ aws logs filter-log-events \
 
 ## 🆕 최신 업데이트
 
-### v1.2.0 (2025-01-16)
+### v1.3.0 (2025-10-15)
+- **로그그룹별 개별 State 파일 관리**: 각 로그그룹마다 독립적인 State 파일을 관리하여 성능과 확장성 향상
+- **자동 마이그레이션**: 기존 통합 State 파일을 자동으로 로그그룹별 개별 파일로 분리
+- **성능 최적화**: 필요한 로그그룹의 State만 로드하여 S3 호출 최소화
+- **멀티스레딩 안전**: 로그그룹별 독립적 State 관리로 동시성 문제 해결
+- **확장성 개선**: 로그그룹 추가/제거 시 다른 그룹에 영향 없음
+- **오류 처리 개선**: 마이그레이션 시 404 오류를 정상 상황으로 처리
+
+### v1.2.0 (2025-09-16)
 - **전체 백업 모드**: Retention 설정을 무시하고 가장 오래된 로그부터 전체 백업하는 모드 추가
 - **시간 범위 검증**: State 파일 기반으로 중복 로그 수집 방지 로직 구현
 - **모드 전환 지원**: 전체 백업 모드와 일반 모드 간 전환 시 State 파일 기반으로 올바른 시간 범위 계산

@@ -24,7 +24,7 @@ class Config:
     S3_PREFIX = os.getenv('S3_PREFIX', 'CloudWatchLogs')
 
     # S3 상태 관리 설정
-    S3_STATE_KEY = os.getenv('S3_STATE_KEY', f'{S3_PREFIX}State/state.json')
+    S3_STATE_PREFIX = os.getenv('S3_STATE_PREFIX', f'{S3_PREFIX}State')
     USE_S3_STATE = os.getenv('USE_S3_STATE', 'true').lower() == 'true'
 
     # 압축 설정
