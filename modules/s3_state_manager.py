@@ -1,6 +1,7 @@
 import json
 import boto3
 import logging
+import threading
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional
 from botocore.exceptions import ClientError, NoCredentialsError
@@ -21,6 +22,10 @@ class S3StateManager:
         self._cache_timestamp = {}  # {log_group_name: timestamp}
         self._cache_ttl_seconds = 60  # 1분 캐시
 
+        # State 파일 접근용 Lock (로그그룹별) - 멀티스레딩 경쟁 조건 방지
+        self._state_locks = {}  # {log_group_name: Lock}
+        self._locks_lock = threading.Lock()  # Lock 생성용 Lock
+
         # 마이그레이션 실행 (한 번만)
         self._migrate_legacy_state()
 
@@ -29,6 +34,13 @@ class S3StateManager:
         # 로그그룹명에서 '/' 제거하여 S3 키 생성
         clean_name = log_group_name.replace('/', '_')
         return f"{self.state_prefix}/{clean_name}/state.json"
+
+    def _get_lock_for_log_group(self, log_group_name: str) -> threading.Lock:
+        """로그그룹별 Lock을 가져오거나 생성합니다."""
+        with self._locks_lock:
+            if log_group_name not in self._state_locks:
+                self._state_locks[log_group_name] = threading.Lock()
+            return self._state_locks[log_group_name]
 
     def _is_cache_valid(self, log_group_name: str) -> bool:
         """특정 로그그룹의 캐시가 유효한지 확인합니다."""
@@ -220,21 +232,24 @@ class S3StateManager:
         last_event_time: int,
     ) -> bool:
         """특정 스트림의 상태를 업데이트합니다."""
-        try:
-            state = self.load_state(log_group_name)
+        lock = self._get_lock_for_log_group(log_group_name)
 
-            # 스트림 상태 업데이트
-            state['streams'][stream_name] = {
-                'next_token': next_token,
-                'last_event_time': last_event_time,
-                'last_updated': datetime.now(timezone.utc).isoformat()
-            }
+        with lock:  # 멀티스레딩 경쟁 조건 방지
+            try:
+                state = self.load_state(log_group_name)
 
-            return self.save_state(log_group_name, state)
+                # 스트림 상태 업데이트
+                state['streams'][stream_name] = {
+                    'next_token': next_token,
+                    'last_event_time': last_event_time,
+                    'last_updated': datetime.now(timezone.utc).isoformat()
+                }
 
-        except Exception as e:
-            self.logger.error(f"스트림 상태 업데이트 실패: {e}")
-            return False
+                return self.save_state(log_group_name, state)
+
+            except Exception as e:
+                self.logger.error(f"스트림 상태 업데이트 실패: {e}")
+                return False
 
     def get_stream_state(self, log_group_name: str, stream_name: str) -> Optional[Dict[str, Any]]:
         """특정 스트림의 상태를 가져옵니다."""
@@ -311,23 +326,29 @@ class S3StateManager:
 
     def update_last_run_time(self, log_group_name: str) -> bool:
         """로그그룹의 마지막 실행 시간을 업데이트합니다."""
-        try:
-            state = self.load_state(log_group_name)
-            state['last_run_time'] = datetime.now(timezone.utc).isoformat()
-            return self.save_state(log_group_name, state)
-        except Exception as e:
-            self.logger.error(f"마지막 실행 시간 업데이트 실패: {e}")
-            return False
+        lock = self._get_lock_for_log_group(log_group_name)
+
+        with lock:  # 멀티스레딩 경쟁 조건 방지
+            try:
+                state = self.load_state(log_group_name)
+                state['last_run_time'] = datetime.now(timezone.utc).isoformat()
+                return self.save_state(log_group_name, state)
+            except Exception as e:
+                self.logger.error(f"마지막 실행 시간 업데이트 실패: {e}")
+                return False
 
     def update_last_read_time(self, log_group_name: str, read_time: datetime) -> bool:
         """로그그룹의 마지막 읽은 시간을 업데이트합니다."""
-        try:
-            state = self.load_state(log_group_name)
-            state['last_read_time'] = read_time.isoformat()
-            return self.save_state(log_group_name, state)
-        except Exception as e:
-            self.logger.error(f"마지막 읽은 시간 업데이트 실패: {e}")
-            return False
+        lock = self._get_lock_for_log_group(log_group_name)
+
+        with lock:  # 멀티스레딩 경쟁 조건 방지
+            try:
+                state = self.load_state(log_group_name)
+                state['last_read_time'] = read_time.isoformat()
+                return self.save_state(log_group_name, state)
+            except Exception as e:
+                self.logger.error(f"마지막 읽은 시간 업데이트 실패: {e}")
+                return False
 
     def _get_default_state(self, log_group_name: str) -> Dict[str, Any]:
         """기본 상태를 반환합니다."""
@@ -347,30 +368,33 @@ class S3StateManager:
         max_age_hours: int = 24,
     ) -> bool:
         """오래된 스트림 상태를 정리합니다."""
-        try:
-            state = self.load_state(log_group_name)
-            current_time = datetime.now(timezone.utc)
-            cleaned_count = 0
+        lock = self._get_lock_for_log_group(log_group_name)
 
-            streams_to_remove = []
-            for stream_name, stream_state in state['streams'].items():
-                # 오래된 스트림만 제거 (활성 스트림 여부는 무시)
-                if self._is_stream_old(stream_state, current_time, max_age_hours):
-                    streams_to_remove.append(stream_name)
+        with lock:  # 멀티스레딩 경쟁 조건 방지
+            try:
+                state = self.load_state(log_group_name)
+                current_time = datetime.now(timezone.utc)
+                cleaned_count = 0
 
-            for stream_name in streams_to_remove:
-                del state['streams'][stream_name]
-                cleaned_count += 1
+                streams_to_remove = []
+                for stream_name, stream_state in state['streams'].items():
+                    # 오래된 스트림만 제거 (활성 스트림 여부는 무시)
+                    if self._is_stream_old(stream_state, current_time, max_age_hours):
+                        streams_to_remove.append(stream_name)
 
-            if cleaned_count > 0:
-                self.save_state(log_group_name, state)
-                self.logger.info(f"{cleaned_count}개의 오래된 스트림 상태를 정리했습니다.")
+                for stream_name in streams_to_remove:
+                    del state['streams'][stream_name]
+                    cleaned_count += 1
 
-            return True
+                if cleaned_count > 0:
+                    self.save_state(log_group_name, state)
+                    self.logger.info(f"{cleaned_count}개의 오래된 스트림 상태를 정리했습니다.")
 
-        except Exception as e:
-            self.logger.error(f"오래된 스트림 정리 실패: {e}")
-            return False
+                return True
+
+            except Exception as e:
+                self.logger.error(f"오래된 스트림 정리 실패: {e}")
+                return False
 
     def _is_stream_old(self, stream_state: Dict[str, Any], current_time: datetime,
                        max_age_hours: int) -> bool:

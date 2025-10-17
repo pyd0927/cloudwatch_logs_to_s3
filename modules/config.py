@@ -2,7 +2,8 @@ import os
 import boto3
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 class Config:
@@ -95,7 +96,7 @@ class Config:
 
                         # Container Insights의 경우 describe_log_streams에서 firstEventTime이 제대로 표시되지 않음
                         # startFromHead=True를 사용하여 실제 가장 오래된 로그를 찾기
-                        logger.info(f"{log_group_name}: Container Insights 로그그룹 감지 - startFromHead 방식으로 가장 오래된 로그 찾기")
+                        logger.info(f"{log_group_name}: 로그그룹 감지 - startFromHead 방식으로 가장 오래된 로그 찾기")
 
                         # 로그 스트림 목록 가져오기
                         all_streams = []
@@ -118,34 +119,51 @@ class Config:
                                 break
                             next_token = response['nextToken']
 
-                        # 각 스트림에서 startFromHead=True로 가장 오래된 로그 찾기
+                        # 멀티스레딩으로 각 스트림에서 startFromHead=True로 가장 오래된 로그 찾기
                         oldest_event_time = None
                         streams_with_events = 0
                         total_streams = len(all_streams)
+                        max_workers = cls.get_oldest_log_search_workers()
 
-                        for i, stream in enumerate(all_streams[:10]):  # 처음 10개 스트림만 확인 (성능 고려)
-                            stream_name = stream['logStreamName']
-                            try:
-                                response = client.get_log_events(
-                                    logGroupName=log_group_name,
-                                    logStreamName=stream_name,
-                                    startFromHead=True,
-                                    limit=1  # 첫 번째 이벤트만 가져오기
+                        logger.info(
+                            f"{log_group_name}: {total_streams}개 스트림에서 멀티스레딩으로 가장 오래된 로그 검색 시작 "
+                            f"(워커: {max_workers}개)"
+                        )
+                        search_start_time = datetime.now()
+
+                        # ThreadPoolExecutor로 병렬 처리
+                        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                            # 각 스트림을 별도 스레드에서 처리
+                            future_to_stream = {}
+                            for stream in all_streams:
+                                stream_name = stream['logStreamName']
+                                future = executor.submit(
+                                    cls._find_oldest_log_in_stream,
+                                    log_group_name, stream_name, cls.REGION
                                 )
+                                future_to_stream[future] = stream_name
 
-                                events = response.get('events', [])
-                                if events:
-                                    streams_with_events += 1
-                                    first_event_time = events[0].get('timestamp', 0)
-                                    if first_event_time > 0:
+                            # 완료된 작업들의 결과 수집 (5분 타임아웃)
+                            stream_results = []
+                            for future in as_completed(future_to_stream, timeout=300):
+                                stream_name = future_to_stream[future]
+                                try:
+                                    stream_name_result, first_event_time = future.result(timeout=60)
+                                    if first_event_time is not None:
+                                        streams_with_events += 1
+                                        stream_results.append(first_event_time)
                                         if oldest_event_time is None or first_event_time < oldest_event_time:
                                             oldest_event_time = first_event_time
+                                except Exception as e:
+                                    logger.debug(f"스트림 {stream_name} 처리 실패: {e}")
+                                    continue
 
-                            except Exception as e:
-                                logger.debug(f"스트림 {stream_name}에서 로그 확인 실패: {e}")
-                                continue
-
-                        logger.info(f"{log_group_name}: 총 {total_streams}개 스트림 중 {streams_with_events}개에서 로그 발견")
+                        search_end_time = datetime.now()
+                        search_duration = (search_end_time - search_start_time).total_seconds()
+                        logger.info(
+                            f"{log_group_name}: 무제한 Retention - 총 {total_streams}개 스트림 중 "
+                            f"{streams_with_events}개에서 로그 발견 (멀티스레딩 완료, 소요시간: {search_duration:.2f}초)"
+                        )
 
                         if oldest_event_time:
                             # 실제 가장 오래된 로그 시간을 시작점으로 설정
@@ -234,7 +252,7 @@ class Config:
 
                     # Container Insights의 경우 describe_log_streams에서 firstEventTime이 제대로 표시되지 않음
                     # startFromHead=True를 사용하여 실제 가장 오래된 로그를 찾기
-                    logger.info(f"{log_group_name}: Container Insights 로그그룹 감지 - startFromHead 방식으로 가장 오래된 로그 찾기")
+                    logger.info(f"{log_group_name}: 로그스트림 목록 감지 - startFromHead 방식으로 가장 오래된 로그 찾기")
 
                     # 로그 스트림 목록 가져오기
                     all_streams = []
@@ -257,34 +275,54 @@ class Config:
                             break
                         next_token = response['nextToken']
 
-                    # 각 스트림에서 startFromHead=True로 가장 오래된 로그 찾기
+                    # 멀티스레딩으로 각 스트림에서 startFromHead=True로 가장 오래된 로그 찾기 (전체 스트림 검색)
                     oldest_event_time = None
                     streams_with_events = 0
                     total_streams = len(all_streams)
+                    max_workers = cls.get_oldest_log_search_workers()
 
-                    for i, stream in enumerate(all_streams[:10]):  # 처음 10개 스트림만 확인 (성능 고려)
-                        stream_name = stream['logStreamName']
-                        try:
-                            response = client.get_log_events(
-                                logGroupName=log_group_name,
-                                logStreamName=stream_name,
-                                startFromHead=True,
-                                limit=1  # 첫 번째 이벤트만 가져오기
+                    logger.info(
+                        f"{log_group_name}: 전체 백업 모드 - {total_streams}개 스트림에서 멀티스레딩으로 가장 오래된 로그 검색 시작 "
+                        f"(워커: {max_workers}개)"
+                    )
+                    search_start_time = datetime.now()
+
+                    # ThreadPoolExecutor로 병렬 처리
+                    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                        # 각 스트림을 별도 스레드에서 처리
+                        future_to_stream = {}
+                        for stream in all_streams:  # 전체 스트림 검색 ([:10] 제거)
+                            stream_name = stream['logStreamName']
+                            future = executor.submit(
+                                cls._find_oldest_log_in_stream,
+                                log_group_name, stream_name, cls.REGION
                             )
+                            future_to_stream[future] = stream_name
 
-                            events = response.get('events', [])
-                            if events:
-                                streams_with_events += 1
-                                first_event_time = events[0].get('timestamp', 0)
-                                if first_event_time > 0:
+                        # 완료된 작업들의 결과 수집 (10분 타임아웃)
+                        stream_results = []
+                        for future in as_completed(future_to_stream, timeout=600):
+                            stream_name = future_to_stream[future]
+                            try:
+                                stream_name_result, first_event_time = future.result(timeout=120)
+                                if first_event_time is not None:
+                                    streams_with_events += 1
+                                    stream_results.append(first_event_time)
                                     if oldest_event_time is None or first_event_time < oldest_event_time:
                                         oldest_event_time = first_event_time
+                            except TimeoutError as e:
+                                logger.error(f"스트림 {stream_name} 처리 타임아웃 (120초 초과): {e}")
+                                continue
+                            except Exception as e:
+                                logger.error(f"스트림 {stream_name} 처리 실패: {type(e).__name__}: {e}")
+                                continue
 
-                        except Exception as e:
-                            logger.debug(f"스트림 {stream_name}에서 로그 확인 실패: {e}")
-                            continue
-
-                    logger.info(f"{log_group_name}: 총 {total_streams}개 스트림 중 {streams_with_events}개에서 로그 발견")
+                    search_end_time = datetime.now()
+                    search_duration = (search_end_time - search_start_time).total_seconds()
+                    logger.info(
+                        f"{log_group_name}: 전체 백업 모드 - 총 {total_streams}개 스트림 중 "
+                        f"{streams_with_events}개에서 로그 발견 (멀티스레딩 완료, 소요시간: {search_duration:.2f}초)"
+                    )
 
                     if oldest_event_time:
                         # 실제 가장 오래된 로그 시간을 시작점으로 설정
@@ -302,13 +340,21 @@ class Config:
                             f"{log_group_name}: 전체 백업 모드 - 로그를 찾을 수 없음 (7일 전부터) "
                             f"- {start_time} ~ {end_time}"
                         )
-                except Exception as e:
-                    # 오류 발생 시 1년 전부터 시작
+                except TimeoutError as e:
+                    # 타임아웃 발생 시 1년 전부터 시작
                     start_time = current_time - timedelta(days=365)
                     end_time = start_time + timedelta(minutes=cls.MINUTES_BACK)
-                    logger.warning(
-                        f"{log_group_name}: 전체 백업 모드 - 오류 발생 (1년 전부터) "
+                    logger.error(
+                        f"{log_group_name}: 전체 백업 모드 - 타임아웃 발생 (600초 초과) "
                         f"- {e} - {start_time} ~ {end_time}"
+                    )
+                except Exception as e:
+                    # 기타 오류 발생 시 1년 전부터 시작
+                    start_time = current_time - timedelta(days=365)
+                    end_time = start_time + timedelta(minutes=cls.MINUTES_BACK)
+                    logger.error(
+                        f"{log_group_name}: 전체 백업 모드 - 오류 발생: {type(e).__name__}: {e} "
+                        f"- {start_time} ~ {end_time}"
                     )
 
             return start_time, end_time
@@ -431,6 +477,40 @@ class Config:
     def get_max_workers(cls) -> int:
         """최대 워커 스레드 수를 반환합니다."""
         return int(os.getenv('MAX_WORKERS', 4))
+
+    @classmethod
+    def get_oldest_log_search_workers(cls) -> int:
+        """가장 오래된 로그 검색을 위한 워커 스레드 수를 반환합니다."""
+        return int(os.getenv('OLDEST_LOG_SEARCH_WORKERS', 20))
+
+    @staticmethod
+    def _find_oldest_log_in_stream(
+        log_group_name: str, stream_name: str, region_name: str
+    ) -> Tuple[str, Optional[int]]:
+        """개별 스트림에서 가장 오래된 로그를 찾는 정적 메서드"""
+        try:
+            # 각 스레드에서 독립적인 boto3 클라이언트 생성 (스레드 안전성)
+            client = boto3.client('logs', region_name=region_name)
+
+            response = client.get_log_events(
+                logGroupName=log_group_name,
+                logStreamName=stream_name,
+                startFromHead=True,
+                limit=1  # 첫 번째 이벤트만 가져오기
+            )
+
+            events = response.get('events', [])
+            if events:
+                first_event_time = events[0].get('timestamp', 0)
+                return stream_name, first_event_time if first_event_time > 0 else None
+            else:
+                return stream_name, None
+
+        except Exception as e:
+            # 예외 발생 시 None 반환 (로그에서 디버그 레벨로만 기록)
+            logger = logging.getLogger(__name__)
+            logger.debug(f"스트림 {stream_name}에서 로그 확인 실패: {e}")
+            return stream_name, None
 
     @classmethod
     def validate_s3_config(cls):

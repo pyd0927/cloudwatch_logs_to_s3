@@ -23,6 +23,36 @@ class BatchProcessor:
         self.s3_uploader = S3Uploader()
         self.compressor = LogCompressor()
 
+    def _process_single_stream(
+        self, log_group_name: str, stream_name: str,
+        start_time: datetime, end_time: datetime, full_backup: bool
+    ) -> List[Dict[str, Any]]:
+        """개별 로그 스트림을 처리하는 헬퍼 메서드"""
+        try:
+            # 각 스레드마다 새로운 CloudWatchLogReader 인스턴스 생성 (스레드 안전성)
+            reader = CloudWatchLogReader(state_manager=self.state_manager)
+
+            logs = []
+            if full_backup:
+                # 전체 백업 모드
+                for event in reader.get_log_events_for_full_backup(
+                    log_group_name, stream_name, start_time, end_time
+                ):
+                    logs.append(event)
+            else:
+                # 일반 모드
+                for event in reader.get_log_events_with_state(
+                    log_group_name, stream_name, start_time, end_time
+                ):
+                    logs.append(event)
+
+            self.logger.debug(f"스트림 처리 완료: {stream_name} - {len(logs)}개 로그")
+            return logs
+
+        except Exception as e:
+            self.logger.error(f"스트림 처리 실패: {stream_name} - {e}")
+            return []
+
     def process_single_log_group(
         self, config: Dict[str, Any],
         start_time: datetime, end_time: datetime,
@@ -55,8 +85,49 @@ class BatchProcessor:
             if last_run_time and isinstance(last_run_time, str):
                 last_run_time = dateutil.parser.parse(last_run_time)
 
+            # 전체 백업 모드에서 첫 실행 감지 및 초기화
             if full_backup:
-                self.logger.info(f"전체 백업 모드 - 로그그룹 처리: {log_group_name}")
+                is_first_run = not state or not state.get('last_read_time')
+
+                if is_first_run:
+                    self.logger.info(
+                        f"{log_group_name}: 전체 백업 모드 - 첫 실행 감지, "
+                        f"State 파일 초기화만 수행 (로그 수집 건너뛰기)"
+                    )
+
+                    # 1. State 파일 먼저 초기화 (임시 시간으로 저장)
+                    #    -> Lambda 타임아웃 시에도 다음 실행에서 "첫 실행"으로 인식되지 않도록
+                    from datetime import timedelta, timezone
+                    temp_time = datetime.now(timezone.utc) - timedelta(days=365)  # 임시 시간
+                    self.state_manager.update_last_read_time(log_group_name, temp_time)
+                    self.logger.info(f"{log_group_name}: State 파일 임시 초기화 완료 (검색 시작)")
+
+                    # 2. 가장 오래된 로그 찾기 (Config.get_time_range 호출)
+                    actual_start_time, actual_end_time = Config.get_time_range(
+                        log_group_name, retention_day=-1, last_read_time=last_read_time, last_run_time=last_run_time
+                    )
+
+                    # 3. State 파일에 실제 가장 오래된 시간으로 업데이트
+                    self.state_manager.update_last_read_time(log_group_name, actual_start_time)
+
+                    # 4. 실제 로그 수집은 건너뛰기
+                    self.logger.info(
+                        f"{log_group_name}: State 파일 초기화 완료 "
+                        f"(oldest_time: {actual_start_time}). 다음 실행부터 백업 시작"
+                    )
+
+                    result.update({
+                        'success': True,
+                        'logs_count': 0,
+                        'message': 'State 파일 초기화 완료 (첫 실행)',
+                        'initialized': True,
+                        'oldest_time': actual_start_time.isoformat()
+                    })
+                    return result
+                else:
+                    # 두 번째 실행부터: 정상 백업
+                    self.logger.info(f"{log_group_name}: 전체 백업 모드 - State 파일 기반 백업 수행")
+
                 # 전체 백업 모드에서는 retention_day=-1으로 전달하여 전체 백업 모드로 처리
                 actual_start_time, actual_end_time = Config.get_time_range(
                     log_group_name, retention_day=-1, last_read_time=last_read_time, last_run_time=last_run_time
@@ -96,119 +167,122 @@ class BatchProcessor:
             self.logger.info(f"접두사 처리 순서 (길이 순): {sorted_prefixes}")
 
             for stream_prefix in sorted_prefixes:
-                # CloudWatch에서 로그 가져오기
+                # CloudWatch에서 스트림 목록 먼저 가져오기
                 reader = CloudWatchLogReader(state_manager=self.state_manager)
                 # 새로운 로그그룹 처리 시 매칭된 스트림 추적 초기화
                 reader.reset_matched_streams()
 
                 if full_backup:
-                    # 전체 백업 모드: MINUTES_BACK 기반으로 시간 범위 설정하여 읽기
-                    logs = reader.get_all_logs_for_full_backup(
-                        log_group_name, stream_prefix, actual_start_time, actual_end_time
-                    )
-
-                    # 활성 스트림 수집 (시간 범위 무시)
+                    # 전체 백업 모드: 스트림 목록 가져오기 (시간 범위 무시)
                     streams = reader.get_log_streams_for_full_backup(log_group_name, stream_prefix)
-                    for stream in streams:
-                        if stream['logStreamName'] not in all_active_streams:
-                            all_active_streams.append(stream['logStreamName'])
-
-                    # matched_streams에서도 활성 스트림 수집 (이미 처리된 스트림도 활성으로 간주)
-                    matched_streams = reader.get_matched_streams()
-                    for stream_name in matched_streams:
-                        if stream_name not in all_active_streams:
-                            all_active_streams.append(stream_name)
-
-                    # 스트림이 존재하면 처리됨으로 표시 (로그가 없어도 시간 진행)
-                    if streams or len(matched_streams) > 0:
-                        streams_processed = True
-                        any_streams_found = True
                 else:
-                    # 기존 모드: 시간 범위 기반으로 로그 읽기
-                    logs = reader.get_all_logs_with_state(
-                        log_group_name, stream_prefix, actual_start_time, actual_end_time
-                    )
-
-                    # 활성 스트림 수집 (로그가 없어도 스트림 자체는 활성으로 간주)
+                    # 일반 모드: 시간 범위 기반으로 스트림 목록 가져오기
                     streams = reader.get_log_streams(
                         log_group_name, stream_prefix, actual_start_time, actual_end_time
                     )
-                    for stream in streams:
-                        if stream['logStreamName'] not in all_active_streams:
-                            all_active_streams.append(stream['logStreamName'])
 
-                    # matched_streams에서도 활성 스트림 수집 (이미 처리된 스트림도 활성으로 간주)
-                    matched_streams = reader.get_matched_streams()
-                    for stream_name in matched_streams:
-                        if stream_name not in all_active_streams:
-                            all_active_streams.append(stream_name)
+                # 활성 스트림 수집
+                for stream in streams:
+                    if stream['logStreamName'] not in all_active_streams:
+                        all_active_streams.append(stream['logStreamName'])
 
-                    # 스트림이 존재하면 처리됨으로 표시 (로그가 없어도 시간 진행)
-                    if streams or len(matched_streams) > 0:
-                        streams_processed = True
-                        any_streams_found = True
+                # matched_streams에서도 활성 스트림 수집 (이미 처리된 스트림도 활성으로 간주)
+                matched_streams = reader.get_matched_streams()
+                for stream_name in matched_streams:
+                    if stream_name not in all_active_streams:
+                        all_active_streams.append(stream_name)
 
-                if logs:
-                    # 스트림별로 로그를 그룹핑
-                    logs_by_stream = {}
-                    for log in logs:
-                        # 로그에서 스트림 이름 추출 (logStream 필드 또는 추론)
-                        stream_name = log.get('logStream', 'unknown')
-                        if stream_name not in logs_by_stream:
-                            logs_by_stream[stream_name] = []
-                        logs_by_stream[stream_name].append(log)
+                # 스트림이 존재하면 처리됨으로 표시 (로그가 없어도 시간 진행)
+                if streams or len(matched_streams) > 0:
+                    streams_processed = True
+                    any_streams_found = True
 
-                    self.logger.info(f"{stream_prefix}: {len(logs_by_stream)}개 스트림에서 총 {len(logs)}개 로그 수집")
+                # 멀티스레딩으로 각 스트림 처리
+                if streams:
+                    self.logger.info(f"{stream_prefix}: {len(streams)}개 스트림을 멀티스레딩으로 처리")
 
-                    # S3 키 생성
-                    s3_key = Config.get_s3_key(log_group_name, actual_start_time, actual_end_time, stream_prefix)
+                    # ThreadPoolExecutor로 스트림들을 병렬 처리
+                    with ThreadPoolExecutor(max_workers=min(len(streams), self.max_workers)) as stream_executor:
+                        # 각 스트림을 별도 스레드에서 처리
+                        future_to_stream = {}
+                        for stream in streams:
+                            stream_name = stream['logStreamName']
+                            future = stream_executor.submit(
+                                self._process_single_stream,
+                                log_group_name, stream_name, actual_start_time, actual_end_time, full_backup
+                            )
+                            future_to_stream[future] = stream_name
 
-                    # 로그 압축 (모든 스트림의 로그를 하나로 합쳐서 압축)
-                    compressed_data = self.compressor.compress_logs(
-                        logs, format_type='json', filename=s3_key
-                    )
+                        # 완료된 작업들의 결과 수집
+                        stream_logs = []
+                        for future in as_completed(future_to_stream, timeout=300):  # 5분 타임아웃
+                            stream_name = future_to_stream[future]
+                            try:
+                                logs = future.result(timeout=300)  # 각 스트림당 5분 타임아웃
+                                stream_logs.extend(logs)
+                                if logs:
+                                    self.logger.debug(f"{stream_prefix}/{stream_name}: {len(logs)}개 로그 수집")
+                            except Exception as e:
+                                self.logger.error(f"{stream_prefix}/{stream_name}: 스트림 처리 실패 - {e}")
 
-                    # 압축 결과 검증
-                    if not compressed_data:
-                        self.logger.error(f"압축 실패: {stream_prefix}")
-                        continue
+                    # 로그가 있으면 압축 및 업로드
+                    if stream_logs:
+                        # timestamp 기준으로 정렬하여 일관성 유지
+                        stream_logs.sort(key=lambda x: x.get('timestamp', 0))
 
-                    if not compressed_data.startswith(b'\x1f\x8b'):
-                        self.logger.error(f"압축 데이터에 gzip 헤더 없음: {stream_prefix}")
-                        self.logger.error(f"예상 헤더: 1f8b, 실제 헤더: {compressed_data[:2].hex()}")
-                        continue
+                        self.logger.info(f"{stream_prefix}: {len(streams)}개 스트림에서 총 {len(stream_logs)}개 로그 수집")
 
-                    # 압축 비율 계산
-                    original_size = sum(len(json.dumps(log, ensure_ascii=False)) for log in logs)
-                    compression_ratio = self.compressor.get_compression_ratio(original_size, len(compressed_data))
+                        # S3 키 생성
+                        s3_key = Config.get_s3_key(log_group_name, actual_start_time, actual_end_time, stream_prefix)
 
-                    self.logger.info(
-                        f"압축 완료: {stream_prefix} ({len(compressed_data)} bytes, {compression_ratio:.1f}% 압축)")
+                        # 로그 압축 (모든 스트림의 로그를 하나로 합쳐서 압축)
+                        compressed_data = self.compressor.compress_logs(
+                            stream_logs, format_type='json', filename=s3_key
+                        )
 
-                    # S3에 업로드
-                    upload_success = self.s3_uploader.upload_compressed_logs(
-                        Config.S3_BUCKET_NAME,
-                        s3_key,
-                        compressed_data
-                    )
+                        # 압축 결과 검증
+                        if not compressed_data:
+                            self.logger.error(f"압축 실패: {stream_prefix}")
+                            continue
 
-                    if upload_success:
-                        result['uploaded_files'].append({
-                            'stream_prefix': stream_prefix,
-                            's3_key': s3_key,
-                            'logs_count': len(logs),
-                            'original_size': original_size,
-                            'compressed_size': len(compressed_data),
-                            'compression_ratio': round(compression_ratio, 1)
-                        })
+                        if not compressed_data.startswith(b'\x1f\x8b'):
+                            self.logger.error(f"압축 데이터에 gzip 헤더 없음: {stream_prefix}")
+                            self.logger.error(f"예상 헤더: 1f8b, 실제 헤더: {compressed_data[:2].hex()}")
+                            continue
+
+                        # 압축 비율 계산
+                        original_size = sum(len(json.dumps(log, ensure_ascii=False)) for log in stream_logs)
+                        compression_ratio = self.compressor.get_compression_ratio(original_size, len(compressed_data))
+
                         self.logger.info(
-                            f"{stream_prefix}: {len(logs)}개 → S3 업로드 완료 ({compression_ratio:.1f}% 압축)")
-                    else:
-                        self.logger.error(f"{stream_prefix}: S3 업로드 실패")
-                else:
-                    self.logger.warning(f"{stream_prefix}: 수집된 로그 없음")
+                            f"압축 완료: {stream_prefix} ({len(compressed_data)} bytes, {compression_ratio:.1f}% 압축)")
 
-                all_logs.extend(logs)
+                        # S3에 업로드
+                        upload_success = self.s3_uploader.upload_compressed_logs(
+                            Config.S3_BUCKET_NAME,
+                            s3_key,
+                            compressed_data
+                        )
+
+                        if upload_success:
+                            result['uploaded_files'].append({
+                                'stream_prefix': stream_prefix,
+                                's3_key': s3_key,
+                                'logs_count': len(stream_logs),
+                                'original_size': original_size,
+                                'compressed_size': len(compressed_data),
+                                'compression_ratio': round(compression_ratio, 1)
+                            })
+                            self.logger.info(
+                                f"{stream_prefix}: {len(stream_logs)}개 → S3 업로드 완료 ({compression_ratio:.1f}% 압축)")
+                        else:
+                            self.logger.error(f"{stream_prefix}: S3 업로드 실패")
+
+                        all_logs.extend(stream_logs)
+                    else:
+                        self.logger.warning(f"{stream_prefix}: 수집된 로그 없음")
+                else:
+                    self.logger.warning(f"{stream_prefix}: 처리할 스트림 없음")
 
             result['logs_count'] = len(all_logs)
             result['success'] = len(result['uploaded_files']) > 0
@@ -307,11 +381,11 @@ class BatchProcessor:
                 )
                 future_to_config[future] = config
 
-            # 완료된 작업들의 결과 수집 (타임아웃 4분)
-            for future in as_completed(future_to_config, timeout=240):
+            # 완료된 작업들의 결과 수집 (타임아웃 10분)
+            for future in as_completed(future_to_config, timeout=600):
                 config = future_to_config[future]
                 try:
-                    result = future.result(timeout=240)  # 각 작업당 4분 타임아웃
+                    result = future.result(timeout=600)  # 각 작업당 10분 타임아웃
                     results.append(result)
 
                     if result['success']:
